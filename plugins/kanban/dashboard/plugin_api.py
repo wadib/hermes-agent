@@ -165,7 +165,7 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
-BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
+BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "approved", "done"]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -524,15 +524,24 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     return _set_status_direct(conn, task_id, s)
 
 
+def _set_approved_status(conn, task_id: str) -> bool:
+    """Persist the human APPROVED signal without a run, event, notification, or dispatcher action."""
+    with kanban_db.write_txn(conn):
+        cur = conn.execute("UPDATE tasks SET status = 'approved' WHERE id = ?", (task_id,))
+    return cur.rowcount == 1
+
+
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) with ``force=True``: a dashboard action is a human override of a live worker claim.
+# ``approved`` is deliberately inert: it updates only ``tasks.status`` and does not dispatch work.
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(conn, tid, result=p.result, summary=p.summary, metadata=p.metadata),
     "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
+    "approved": lambda conn, tid, p: _set_approved_status(conn, tid),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
     "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
     "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}

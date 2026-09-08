@@ -16,7 +16,7 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    'approved' | 'archived' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
     { label: string; help: string }
   >
   locked: { review: string; running: string; scheduled: string }
@@ -224,6 +224,7 @@ export const en: KanbanMessages = {
     running: { label: 'Running', help: 'Claimed by a worker — an agent is on it. Set by the dispatcher.' },
     blocked: { label: 'Blocked', help: 'The worker asked for human input.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
+    approved: { label: 'Approved', help: 'Human-approved signal only — it never starts or dispatches work.' },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
     archived: { label: 'Archived', help: 'Hidden from the default board view.' }
   },
@@ -436,6 +437,7 @@ const ja: KanbanMessages = {
     running: { label: '実行中', help: 'ワーカーが取得済み — エージェントが作業中。ディスパッチャが設定します。' },
     blocked: { label: 'ブロック', help: 'ワーカーが人間の入力を求めています。' },
     review: { label: 'レビュー', help: 'レビューエージェントが作業を確認中。ディスパッチャが設定します。' },
+    approved: { label: '承認済み', help: '人間が承認したことを示すだけで、作業を開始・ディスパッチしません。' },
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
     archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
   },
@@ -647,6 +649,7 @@ const zh: KanbanMessages = {
     running: { label: '运行中', help: '已被工作单元领取 — 有代理在处理。由调度器设置。' },
     blocked: { label: '受阻', help: '工作单元需要人工输入。' },
     review: { label: '审查', help: '审查代理正在检查工作。由调度器设置。' },
+    approved: { label: '已批准', help: '仅表示人工已批准；不会启动或调度工作。' },
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
     archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
   },
@@ -855,6 +858,7 @@ const zhHant: KanbanMessages = {
     running: { label: '執行中', help: '已被工作單元領取 — 有代理在處理。由排程器設定。' },
     blocked: { label: '受阻', help: '工作單元需要人工輸入。' },
     review: { label: '審查', help: '審查代理正在檢查工作。由排程器設定。' },
+    approved: { label: '已核准', help: '僅表示人工已核准；不會啟動或排程工作。' },
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
     archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
   },

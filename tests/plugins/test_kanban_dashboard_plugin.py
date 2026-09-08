@@ -164,6 +164,39 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     assert not any(t["id"] == task["id"] for t in columns["todo"])
 
 
+def test_patch_approved_is_inert_and_persists_raw_status(client):
+    """Human approval is a visible status only: no worker/run is created or claimed."""
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "human approval only"}).json()["task"]
+    raw_columns = "status, created_at, started_at, completed_at, claim_lock, claim_expires, worker_pid, current_run_id"
+    with kbc.connect() as conn:
+        before = conn.execute(f"SELECT {raw_columns} FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+        event_count_before = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task["id"],)).fetchone()[0]
+    assert before is not None
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "approved"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "approved"
+    with kbc.connect() as conn:
+        raw = conn.execute(f"SELECT {raw_columns} FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+        assert raw is not None
+        assert raw["status"] == "approved"
+        assert {key for key in raw.keys() if raw[key] != before[key]} == {"status"}
+        assert raw["current_run_id"] is None
+        assert raw["worker_pid"] is None
+        assert raw["claim_lock"] is None
+        event_count_after = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (task["id"],)).fetchone()[0]
+        assert event_count_after == event_count_before
+
+    board = client.get("/api/plugins/kanban/board")
+    assert board.status_code == 200, board.text
+    columns = {column["name"]: column["tasks"] for column in board.json()["columns"]}
+    assert any(card["id"] == task["id"] for card in columns["approved"])
+
+
 def test_tenant_filter(client):
     client.post("/api/plugins/kanban/tasks", json={"title": "A", "tenant": "t1"})
     client.post("/api/plugins/kanban/tasks", json={"title": "B", "tenant": "t2"})
