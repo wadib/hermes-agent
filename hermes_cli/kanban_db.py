@@ -2955,12 +2955,10 @@ def _route_block(
 
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Every other kind counts unblock-loop
-    recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    as something to "unblock". ``needs_input`` and ``capability`` describe
+    durable external gates, not recoverable worker loops, so they remain
+    blocked even when repeated. Only transient or untyped recurring failures
+    route to ``triage`` for human rework.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
@@ -2968,6 +2966,8 @@ def _route_block(
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    if kind in {"needs_input", "capability"}:
+        return "blocked", "blocked", set_sql, (kind, recurrences), payload
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload

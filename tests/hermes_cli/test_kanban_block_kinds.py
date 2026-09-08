@@ -7,9 +7,10 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
   never enter the human ``blocked`` bucket a cron would keep unblocking.
-* ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
-  each same-cause re-block after an unblock increments ``block_recurrences``,
-  and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+* ``needs_input`` / ``capability`` blocks remain in ``blocked`` until their
+  named human action or capability exists; they never auto-triage or fan out.
+* ``transient`` / un-typed blocks increment ``block_recurrences`` and route to
+  ``triage`` at ``BLOCK_RECURRENCE_LIMIT`` for recoverable rework.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -64,19 +65,47 @@ def _make_running_again(conn, tid):
 
 
 
-def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
+@pytest.mark.parametrize("kind", ["needs_input", "capability"])
+def test_human_or_capability_block_never_auto_triages(kanban_home: Path, kind: str) -> None:
     with kbc.connect_closing() as conn:
         tid = _running_task(conn)
-        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.block_task(conn, tid, reason="waiting", kind=kind)
         kb.unblock_task(conn, tid)
         _make_running_again(conn, tid)
-        kb.block_task(conn, tid, reason="x", kind="capability")
-        events = [e for e in kb.list_events(conn, tid)
-                  if e.kind == "block_loop_detected"]
-        assert events, "expected a block_loop_detected event"
-        payload = events[-1].payload or {}
-        assert payload.get("recurrences") == 2
-        assert payload.get("kind") == "capability"
+        kb.block_task(conn, tid, reason="still waiting", kind=kind)
+        promoted = kb.recompute_ready(conn)
+
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert promoted == 0
+    assert task.status == "blocked"
+    assert task.block_kind == kind
+    assert task.block_recurrences == 2
+    assert not any(event.kind == "block_loop_detected" for event in events)
+
+
+def test_transient_block_loop_still_routes_to_triage(kanban_home: Path) -> None:
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="retry later", kind="transient")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="retry later", kind="transient")
+
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task.status == "triage"
+    loop_events = [event for event in events if event.kind == "block_loop_detected"]
+    assert len(loop_events) == 1
+    assert loop_events[0].payload == {
+        "reason": "retry later",
+        "kind": "transient",
+        "recurrences": 2,
+        "source_status": "ready",
+        "limit": kb.BLOCK_RECURRENCE_LIMIT,
+    }
 
 
 # ---------------------------------------------------------------------------

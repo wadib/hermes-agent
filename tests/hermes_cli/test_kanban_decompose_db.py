@@ -70,6 +70,29 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.assignee == "engineer"
 
 
+@pytest.mark.parametrize("kind", ["needs_input", "capability"])
+def test_decompose_refuses_legacy_human_or_capability_gate(kanban_home, kind):
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="waiting on an external prerequisite")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET block_kind = ? WHERE id = ?", (kind, tid))
+
+        child_ids = decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[{"title": "must not fan out", "assignee": "researcher"}],
+            author="decomposer",
+        )
+        root = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert child_ids is None
+    assert root.status == "triage"
+    assert root.block_kind == kind
+    assert not any(event.kind == "decomposed" for event in events)
+
+
 def test_decompose_records_audit_comment_and_event(kanban_home):
     with kbc.connect() as conn:
         tid = _create_triage(conn)

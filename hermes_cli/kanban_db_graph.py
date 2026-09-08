@@ -115,10 +115,14 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, block_kind "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
+            return None
+        if root_row["block_kind"] in {"needs_input", "capability"}:
+            # A human or capability gate is a named external prerequisite, not
+            # unfinished work to fan out. Preserve the durable block semantics.
             return None
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
