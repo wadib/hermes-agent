@@ -117,6 +117,25 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_projection_preserves_typed_block_kind_without_rewriting_title(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Operator decides the retry"},
+    ).json()["task"]
+
+    with kbc.connect() as conn:
+        assert kb.block_task(
+            conn, task["id"], kind="needs_input", reason="Choose whether to retry",
+        )
+
+    response = client.get("/api/plugins/kanban/board")
+    assert response.status_code == 200
+    blocked = next(column["tasks"] for column in response.json()["columns"] if column["name"] == "blocked")
+    projected = next(item for item in blocked if item["id"] == task["id"])
+
+    assert projected["block_kind"] == "needs_input"
+    assert projected["title"] == "Operator decides the retry"
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

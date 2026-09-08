@@ -3,6 +3,7 @@
 
 import {
   atom,
+  Badge,
   coarseElapsed,
   Codicon,
   DropdownMenu,
@@ -18,7 +19,7 @@ import {
 import { type ReactNode, useEffect, useState } from 'react'
 
 import { fetchOrchestration, ORCHESTRATION_KEY } from './api'
-import { columnLabel, useKanban } from './i18n'
+import { columnLabel, type KanbanText, useKanban } from './i18n'
 import { columnMeta, type KanbanTask } from './types'
 
 // Plugin-scoped i18n lives in ./i18n; re-exported so components import strings
@@ -73,6 +74,37 @@ export function errText(err: unknown): string {
 
 /** Backend timestamps are epoch SECONDS; the canonical formatter takes ms. */
 export const ago = (seconds?: null | number): null | string => (seconds ? relativeTime(seconds * 1000) : null)
+
+/** Ownership is data, not a title convention. Unknown/legacy failures stay in
+ *  the agent lane so an incomplete payload never falsely asks the owner to act. */
+export function blockOwnerBadge(
+  blockKind: null | string | undefined,
+  labels: KanbanText['blockOwner']
+): { icon: string; label: string; variant: 'destructive' | 'muted' | 'warn' } {
+  if (blockKind === 'needs_input') {
+    return { icon: 'account', label: labels.you, variant: 'warn' }
+  }
+
+  if (blockKind === 'capability') {
+    return { icon: 'error', label: labels.wall, variant: 'destructive' }
+  }
+
+  return { icon: 'robot', label: labels.agent, variant: 'muted' }
+}
+
+/** Visible owner badge for a blocked card. The label remains in every locale
+ *  because these are short operational identifiers, not prose. */
+export function BlockOwnerBadge({ blockKind }: { blockKind?: null | string }) {
+  const k = useKanban()
+  const owner = blockOwnerBadge(blockKind, k.blockOwner)
+
+  return (
+    <Badge className="shrink-0" size="xs" variant={owner.variant}>
+      <Codicon name={owner.icon} size="0.7rem" />
+      {owner.label}
+    </Badge>
+  )
+}
 
 const ELAPSED_SUFFIX = { day: 'd', hour: 'h', minute: 'm', second: 's' } as const
 

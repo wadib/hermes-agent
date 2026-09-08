@@ -8,6 +8,8 @@ export interface KanbanTask {
   title: string
   body?: null | string
   status: string
+  /** Structured block owner from the backend; only rendered for blocked cards. */
+  block_kind?: null | string
   assignee?: null | string
   priority?: number
   tenant?: null | string

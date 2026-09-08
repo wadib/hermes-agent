@@ -88,6 +88,7 @@ import {
   type ArcState,
   arcState,
   Avatar,
+  BlockOwnerBadge,
   columnHelp,
   columnLabel,
   errText,
@@ -297,6 +298,7 @@ function Card({
           <span className="line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground">
             {task.title || task.id}
           </span>
+          {task.status === 'blocked' && <BlockOwnerBadge blockKind={task.block_kind} />}
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}

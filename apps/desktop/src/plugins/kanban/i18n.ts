@@ -19,6 +19,7 @@ type KanbanMessages = {
     'archived' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
     { label: string; help: string }
   >
+  blockOwner: { you: string; wall: string; agent: string }
   locked: { review: string; running: string; scheduled: string }
   arcRunning: string
   arcStale: string
@@ -227,6 +228,7 @@ export const en: KanbanMessages = {
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
     archived: { label: 'Archived', help: 'Hidden from the default board view.' }
   },
+  blockOwner: { you: 'YOU', wall: 'WALL', agent: 'AGENT' },
   locked: {
     review: 'Review is entered by the dispatcher when a review agent takes the card.',
     running: 'Running is set by the dispatcher when a worker claims the card.',
@@ -439,6 +441,7 @@ const ja: KanbanMessages = {
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
     archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
   },
+  blockOwner: { you: 'YOU', wall: 'WALL', agent: 'AGENT' },
   locked: {
     review: 'レビューは、レビューエージェントがカードを取得するとディスパッチャによって設定されます。',
     running: '実行中は、ワーカーがカードを取得するとディスパッチャによって設定されます。',
@@ -650,6 +653,7 @@ const zh: KanbanMessages = {
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
     archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
   },
+  blockOwner: { you: 'YOU', wall: 'WALL', agent: 'AGENT' },
   locked: {
     review: '审查状态由调度器在审查代理领取卡片时设置。',
     running: '运行中由调度器在工作单元领取卡片时设置。',
@@ -858,6 +862,7 @@ const zhHant: KanbanMessages = {
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
     archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
   },
+  blockOwner: { you: 'YOU', wall: 'WALL', agent: 'AGENT' },
   locked: {
     review: '審查狀態由排程器在審查代理領取卡片時設定。',
     running: '執行中由排程器在工作單元領取卡片時設定。',
