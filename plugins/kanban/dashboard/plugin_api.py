@@ -527,17 +527,29 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
 
 
 def _approve_task(conn, task_id: str, p) -> bool:
-    """Move a card to the inert ``approved`` status: a pure human signal, no dispatcher
-    side effect (see PATCH-approval-only in the standing rule — this must never auto-start a
-    worker). Records an ``approved`` event with actor + timestamp so the board can prove an
-    approval happened, distinct from the generic ``status`` event other verbs emit."""
+    """Move a card through the human-facing APPROVED gate: writes the inert approval
+    record (status + a distinct ``approved`` event with actor + timestamp — the audit
+    trail @analyst required), then, in the SAME transaction, checks dependencies via
+    the existing ``_parents_satisfied`` guard (the identical check ``ready`` already
+    uses) and promotes straight to ``ready`` so the dispatcher picks it up normally.
+    APPROVED is the only human go-action; ``ready`` remains dispatcher-internal state
+    — no second human control, no separate dispatch-trigger code path to get wrong
+    (that duplication is what broke 5ed3e32). If parents aren't satisfied yet, the
+    card lands on 'approved' and stays there — a human blessed it, but the system
+    correctly won't dispatch a task whose upstream work isn't done."""
+    now = int(time.time())
     with kanban_db.write_txn(conn):
         cur = conn.execute("UPDATE tasks SET status = 'approved' WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
         conn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'approved', ?, ?)",
-            (task_id, json.dumps({"approved_by": getattr(p, "approved_by", None) or "dashboard"}), int(time.time())))
+            (task_id, json.dumps({"approved_by": getattr(p, "approved_by", None) or "dashboard"}), now))
+        if kanban_db._parents_satisfied(conn, task_id):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'status', ?, ?)",
+                (task_id, json.dumps({"status": "ready", "requested_status": "ready", "reason": "approved"}), now))
     return True
 
 
