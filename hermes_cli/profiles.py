@@ -264,17 +264,29 @@ def profile_matches_home(name: str, home: "Path | None" = None) -> bool:
 
 
 def _iter_named_profile_dirs(*, live_only: bool = True) -> List[Path]:
-    """Sorted named-profile dirs (valid ids, never ``default``); ``live_only`` skips tombstones."""
+    """Sorted named-profile dirs (valid canonical ids, never ``default``).
+
+    Legacy releases could leave mixed-case directory names behind.  Accept those directories
+    when their normalized name is valid, while preferring an exact canonical directory if a
+    case-sensitive filesystem contains both spellings.  Callers expose the normalized id but
+    retain this returned path so no profile data has to move merely to become discoverable.
+    """
     profiles_root = _get_profiles_root()
     if not profiles_root.is_dir():
         return []
-    return [
-        entry for entry in sorted(profiles_root.iterdir())
-        if entry.is_dir()
-        and entry.name != "default"
-        and _PROFILE_ID_RE.match(entry.name)
-        and not (live_only and named_profile_is_deleted(entry))
-    ]
+    selected: dict[str, Path] = {}
+    for entry in sorted(profiles_root.iterdir()):
+        if not entry.is_dir() or entry.name.casefold() == "default":
+            continue
+        canonical = normalize_profile_name(entry.name)
+        if not _PROFILE_ID_RE.match(canonical):
+            continue
+        if live_only and named_profile_is_deleted(entry):
+            continue
+        current = selected.get(canonical)
+        if current is None or entry.name == canonical:
+            selected[canonical] = entry
+    return [selected[name] for name in sorted(selected)]
 
 
 def list_profile_names() -> List[str]:
@@ -282,7 +294,7 @@ def list_profile_names() -> List[str]:
     reads NO per-profile config — safe for hot paths (cron target listings, create validation)."""
     names = ["default"]
     with contextlib.suppress(OSError):
-        names.extend(entry.name for entry in _iter_named_profile_dirs(live_only=False))
+        names.extend(normalize_profile_name(entry.name) for entry in _iter_named_profile_dirs(live_only=False))
     return names
 
 
@@ -699,8 +711,9 @@ def list_profiles() -> List[ProfileInfo]:
     if named:
         alias_map = build_alias_map()  # ONCE, not per profile (was the dominant cost)
         for entry in named:
-            alias_name = alias_map.get(normalize_profile_name(entry.name))
-            profiles.append(_profile_info(entry.name, entry, is_default=False, alias_name=alias_name))
+            name = normalize_profile_name(entry.name)
+            alias_name = alias_map.get(name)
+            profiles.append(_profile_info(name, entry, is_default=False, alias_name=alias_name))
     return profiles
 
 
@@ -729,8 +742,9 @@ def profiles_to_serve(multiplex: bool, profile_allowlist: Optional[List[str]] = 
             if name != "default":
                 allowed.add(name)
     for entry in _iter_named_profile_dirs():
-        if allowed is None or entry.name in allowed:
-            serve.append((entry.name, entry))
+        name = normalize_profile_name(entry.name)
+        if allowed is None or name in allowed:
+            serve.append((name, entry))
     if allowed is not None:
         missing = tuple(sorted(allowed - {name for name, _ in serve}))
         if missing and missing not in _WARNED_MISSING_ALLOWLIST_ENTRIES:
@@ -945,7 +959,7 @@ def backfill_profile_envs(quiet: bool = False) -> List[str]:
             else:
                 env_path.write_text(_PLACEHOLDER_ENV, encoding="utf-8")
             os.chmod(str(env_path), 0o600)
-            backfilled.append(entry.name)
+            backfilled.append(normalize_profile_name(entry.name))
         except OSError as e:
             if not quiet:
                 print(f"⚠ Could not seed .env for profile '{entry.name}': {e}")

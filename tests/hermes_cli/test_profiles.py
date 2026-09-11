@@ -539,6 +539,17 @@ class TestListProfiles:
         assert "alpha" in names
         assert "beta" in names
 
+    def test_legacy_mixed_case_directory_is_listed_by_canonical_name(self, profile_env):
+        profiles_root = _get_profiles_root()
+        legacy = profiles_root / "HermesVault"
+        legacy.mkdir(parents=True)
+        (legacy / "profile.yaml").write_text("description: Legacy vault steward\n", encoding="utf-8")
+
+        found = [profile for profile in list_profiles() if profile.name == "hermesvault"]
+
+        assert len(found) == 1
+        assert found[0].path == legacy
+
 
 # ===================================================================
 # TestActiveProfile
