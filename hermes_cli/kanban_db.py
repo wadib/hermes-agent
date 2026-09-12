@@ -86,7 +86,10 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "delivery_pending", "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
@@ -2663,7 +2666,9 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    task = get_task(conn, task_id)
+    delivery_required = bool(task and task.delivery_required)
+    acceptance = None if delivery_required else prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
     with write_txn(conn):
@@ -2674,9 +2679,11 @@ def complete_task(
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         prior_status = _task_status(conn, task_id)
+        target_status = "delivery_pending" if delivery_required else "done"
+        target_completed_at = None if delivery_required else now
         sql = """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -2687,7 +2694,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
-        params: tuple = (result, now, task_id)
+        params: tuple = (target_status, result, target_completed_at, task_id)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
@@ -2696,8 +2703,10 @@ def complete_task(
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
-            conn, task_id, outcome="completed", status="done", summary=handoff_summary,
-            metadata=metadata,
+            conn, task_id,
+            outcome="delivery_pending" if delivery_required else "completed",
+            status=target_status,
+            summary=handoff_summary, metadata=metadata,
         )
         # Never-claimed task: synthesize a run so the handoff fields survive.
         if run_id is None and (summary or metadata or result or prior_status == "review"):
@@ -2706,16 +2715,21 @@ def complete_task(
                 synth_summary = _REVIEW_APPROVED_NOTE
                 synth_metadata = {"source_status": "review", "approval": "manual"}
             run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+                conn, task_id,
+                outcome="delivery_pending" if delivery_required else "completed",
+                summary=synth_summary, metadata=synth_metadata,
             )
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
         _append_event(
-            conn, task_id, "completed",
+            conn, task_id, "delivery_pending" if delivery_required else "completed",
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+    if delivery_required:
+        # A persisted worker handoff is not an outbound delivery or acceptance.
+        return True
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)

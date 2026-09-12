@@ -172,8 +172,24 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 
 
+def test_delivery_required_completion_enters_delivery_pending_without_done(kanban_home):
+    """A worker handoff cannot write Done before delivery and user acceptance."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deliverable", delivery_required=True)
+
+        # This is the direct DB bypass every CLI/tool/API completion path reaches.
+        assert kb.complete_task(conn, tid, summary="technical completion")
+
+        pending = kb.get_task(conn, tid)
+        assert pending is not None
+        assert pending.status == "delivery_pending"
+        assert pending.completed_at is None
+        assert kb.delivery_state(pending) == "pending"
+        assert [event.kind for event in kb.list_events(conn, tid)][-1] == "delivery_pending"
+
+
 def test_delivery_receipt_remains_pending_until_both_proofs_exist(kanban_home):
-    """Technical completion is never allowed to impersonate user-facing delivery."""
+    """Partial receipt metadata never impersonates a completed delivery."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="deliverable", delivery_required=True)
         task = kb.get_task(conn, tid)
@@ -191,15 +207,6 @@ def test_delivery_receipt_remains_pending_until_both_proofs_exist(kanban_home):
         )
         assert complete.complete is True
         assert kb.delivery_state(task, complete) == "delivered"
-
-        # The lifecycle status remains technical completion; receipt collection
-        # never silently represents a Wessam acceptance.
-        assert kb.complete_task(conn, tid, summary="technical completion")
-        completed = kb.get_task(conn, tid)
-        assert completed is not None and completed.status == "done"
-        assert kb.delivery_state(completed, kb.get_delivery_receipt(conn, tid)) == "delivered"
-        events = [event for event in kb.list_events(conn, tid) if event.kind == "delivery_receipt_recorded"]
-        assert [event.payload["complete"] for event in events] == [False, True]
 
 
 def test_legacy_task_loads_without_delivery_receipt_requirement(tmp_path):

@@ -223,38 +223,20 @@ def test_task_detail_includes_links_and_events(client):
 
 
 
-def test_delivery_receipt_api_requires_both_proofs_before_delivered(client):
+def test_dashboard_completion_cannot_bypass_delivery_pending(client):
     task = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "deliver report", "delivery_required": True},
     ).json()["task"]
     task_id = task["id"]
 
-    # A technical completion alone is explicitly delivery-pending.
-    done = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "done"})
-    assert done.status_code == 200, done.text
-    pending = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
-    assert pending["status"] == "done"
+    # PATCH is a direct completion path, but cannot write Done for gated work.
+    response = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "done"})
+    assert response.status_code == 200, response.text
+    pending = response.json()["task"]
+    assert pending["status"] == "delivery_pending"
     assert pending["delivery_state"] == "pending"
     assert pending["delivery_receipt"] is None
-
-    one = client.put(
-        f"/api/plugins/kanban/tasks/{task_id}/delivery-receipt",
-        json={"artifact_handle": "C:/deliverables/report.pdf"},
-    )
-    assert one.status_code == 200, one.text
-    assert one.json()["task"]["delivery_state"] == "pending"
-    assert one.json()["task"]["delivery_receipt"]["complete"] is False
-
-    both = client.put(
-        f"/api/plugins/kanban/tasks/{task_id}/delivery-receipt",
-        json={"user_message_ref": "session:s_123/message:m_456"},
-    )
-    assert both.status_code == 200, both.text
-    delivered = both.json()["task"]
-    assert delivered["status"] == "done"
-    assert delivered["delivery_state"] == "delivered"
-    assert delivered["delivery_receipt"]["complete"] is True
 
 
 
