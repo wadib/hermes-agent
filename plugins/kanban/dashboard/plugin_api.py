@@ -168,7 +168,7 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
 BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
-    "delivery_pending", "done",
+    "delivery_pending", "awaiting_acceptance", "done",
 ]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -186,9 +186,25 @@ def _receipt_dict(receipt: Optional[kanban_db.DeliveryReceipt]) -> Optional[dict
     }
 
 
+def _outbox_dict(outbox: Optional[kanban_db.DeliveryOutbox]) -> Optional[dict[str, Any]]:
+    if outbox is None:
+        return None
+    return {
+        "artifact_handle": outbox.artifact_handle,
+        "state": outbox.state,
+        "platform": outbox.platform,
+        "conversation_ref": outbox.conversation_ref,
+        "session_ref": outbox.session_ref,
+        "native_message_id": outbox.native_message_id,
+        "created_at": outbox.created_at,
+        "delivered_at": outbox.delivered_at,
+    }
+
+
 def _task_dict(
     task: kanban_db.Task, *, latest_summary: Optional[str] = None,
     delivery_receipt: Optional[kanban_db.DeliveryReceipt] = None,
+    delivery_outbox: Optional[kanban_db.DeliveryOutbox] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
@@ -200,6 +216,7 @@ def _task_dict(
     d["latest_summary"] = latest_summary
     d["delivery_state"] = kanban_db.delivery_state(task, delivery_receipt)
     d["delivery_receipt"] = _receipt_dict(delivery_receipt)
+    d["delivery_outbox"] = _outbox_dict(delivery_outbox)
     return d
 
 
@@ -318,11 +335,12 @@ def get_board(
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         receipts = kanban_db.delivery_receipts_for(conn, [t.id for t in tasks])
+        outboxes = kanban_db.delivery_outboxes_for(conn, [t.id for t in tasks])
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(
                 t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
-                delivery_receipt=receipts.get(t.id),
+                delivery_receipt=receipts.get(t.id), delivery_outbox=outboxes.get(t.id),
             )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
@@ -378,6 +396,7 @@ def get_task(
         task_d = _task_dict(
             task, latest_summary=kanban_db.latest_summary(conn, task_id),
             delivery_receipt=kanban_db.get_delivery_receipt(conn, task_id),
+            delivery_outbox=kanban_db.get_delivery_outbox(conn, task_id),
         )
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
@@ -521,14 +540,24 @@ class DeliveryReceiptBody(BaseModel):
 
 @router.put("/tasks/{task_id}/delivery-receipt")
 def put_delivery_receipt(task_id: str, payload: DeliveryReceiptBody, board: Optional[str] = Query(None)):
-    """Record one or both explicit delivery proofs; missing proof remains pending."""
-    with _board_conn(board) as (board, conn), _value_error_400():
-        kanban_db.record_delivery_receipt(
-            conn, task_id, artifact_handle=payload.artifact_handle,
-            user_message_ref=payload.user_message_ref, recorded_by="dashboard",
-        )
-        task = _require_task(conn, task_id)
-        return {"task": _task_dict(task, delivery_receipt=kanban_db.get_delivery_receipt(conn, task_id))}
+    """Legacy endpoint intentionally fail-closed: UI input is not transport proof."""
+    raise HTTPException(
+        status_code=409,
+        detail="Delivery receipts are recorded only after a gateway/Desktop transport persists a native message.",
+    )
+
+
+class AcceptDeliveryBody(BaseModel):
+    user_message_ref: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/accept-delivery")
+def accept_delivery(task_id: str, payload: AcceptDeliveryBody, board: Optional[str] = Query(None)):
+    """Fail closed: this unauthenticated REST surface cannot attest to Wessam's message."""
+    raise HTTPException(
+        status_code=409,
+        detail="Delivery acceptance requires a verified user-message or authorized ingress operation; dashboard input is not acceptance evidence.",
+    )
 
 
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------

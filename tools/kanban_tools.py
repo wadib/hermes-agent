@@ -840,29 +840,38 @@ def _handle_create(args: dict, **kw) -> str:
         # The worker/API runtime may be transient; the owning task's origin is durable.
         session_id = (args.get("session_id") or (self_task.session_id if self_task else None)
                       or _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID"))
+        # Every agent-created task must retain an exact durable delivery route.
+        # Resolve it before the insert, then keep the insert and subscription in
+        # one transaction so a missing/failed subscription cannot leave a
+        # briefly claimable orphan behind.
+        origin = _resolve_notify_target()
+        _check(origin is not None, "kanban_create requires a persistent originating session; no delivery route is available")
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
-        new_tid = kb.create_task(
-            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
-            parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
-            priority=_opt_int(args.get("priority"), 0),
-            workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
-            # Board-project inheritance must read the board this call opened, not the
-            # session's current board.
-            board=args.get("board"),
-            project_source_task_id=project_source_task_id, triage=triage,
-            creator_task_id=self_tid,
-            idempotency_key=args.get("idempotency_key"),
-            max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
-            model_override=model_override, provider_override=provider_override,
-            goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
-            completion_contract=args.get("completion_contract"),
-            delivery_required=_parse_bool_arg(args, "delivery_required"),
-            initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+        with kb.write_txn(conn):
+            new_tid = kb.create_task(
+                conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+                parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
+                priority=_opt_int(args.get("priority"), 0),
+                workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
+                # Board-project inheritance must read the board this call opened, not the
+                # session's current board.
+                board=args.get("board"),
+                project_source_task_id=project_source_task_id, triage=triage,
+                creator_task_id=self_tid,
+                idempotency_key=args.get("idempotency_key"),
+                max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+                model_override=model_override, provider_override=provider_override,
+                goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+                completion_contract=args.get("completion_contract"),
+                delivery_required=_parse_bool_arg(args, "delivery_required"),
+                initial_status=str(args.get("initial_status") or "running"),
+                created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            _check(subscribed, "kanban_create could not persist the originating delivery subscription")
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
+        return _ok(task_id=new_tid, **landed, subscribed=True)
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:

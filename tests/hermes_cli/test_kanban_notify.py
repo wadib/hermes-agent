@@ -897,6 +897,55 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     assert "real.pdf" in documents_uploaded[0]
 
 
+@pytest.mark.asyncio
+async def test_notifier_persists_native_artifact_delivery_receipt_once(kanban_home, tmp_path):
+    """A delivery-required completion remains pending until the notifier has a native upload receipt."""
+    from gateway.config import Platform
+    from gateway.platforms.base import SendResult
+    from gateway.run import GatewayRunner
+
+    artifact = tmp_path / "evidence.txt"
+    artifact.write_text("verified", encoding="utf-8")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="deliver", delivery_required=True)
+        kb.add_attachment(
+            conn, task_id, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size,
+        )
+        kbn.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat1")
+        assert kb.complete_task(conn, task_id, summary="ready to deliver")
+        assert kb.get_task(conn, task_id).status == "delivery_pending"
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="native-file-1"))
+    fake_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="native-text-1"))
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    original_sleep = asyncio.sleep
+    ticks = 0
+
+    async def fast_sleep(_):
+        nonlocal ticks
+        await original_sleep(0)
+        ticks += 1
+        if ticks >= 3:
+            runner._running = False
+
+    with patch("gateway.run.asyncio.sleep", side_effect=fast_sleep):
+        await asyncio.wait_for(runner._kanban_notifier_watcher(interval=1), timeout=10.0)
+
+    with kbc.connect() as conn:
+        outbox = kb.get_delivery_outbox(conn, task_id)
+        assert outbox is not None
+        assert outbox.state == "delivered"
+        assert outbox.native_message_id == "native-file-1"
+        assert kb.get_task(conn, task_id).status == "awaiting_acceptance"
+    fake_adapter.send_document.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Migration backfill: pre-delivery_mode gateway subscriptions keep active wake.
 #

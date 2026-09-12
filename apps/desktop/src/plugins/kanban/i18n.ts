@@ -41,6 +41,7 @@ type KanbanMessages = {
   wontRunTip: string
   noHeartbeat: string
   deliveryPending: string
+  deliveryAwaitingAcceptance: string
   expand: (label: string) => string
   collapse: (label: string) => string
   newTaskIn: (label: string) => string
@@ -256,6 +257,7 @@ export const en: KanbanMessages = {
     'Ready cards only run once a profile is assigned. Open the card and set an assignee, or configure a default assignee in orchestration settings.',
   noHeartbeat: 'no heartbeat',
   deliveryPending: 'DELIVERY PENDING',
+  deliveryAwaitingAcceptance: 'DELIVERED — AWAITING WESSAM',
   expand: label => `Expand ${label}`,
   collapse: label => `Collapse ${label}`,
   newTaskIn: label => `New task in ${label}`,
@@ -470,6 +472,7 @@ const ja: KanbanMessages = {
     'Ready のカードはプロフィールが割り当てられて初めて実行されます。カードを開いて担当を設定するか、オーケストレーション設定でデフォルトの担当を設定してください。',
   noHeartbeat: 'ハートビートなし',
   deliveryPending: '配信保留',
+  deliveryAwaitingAcceptance: '配信済み — Wessam の承認待ち',
   expand: label => `${label} を展開`,
   collapse: label => `${label} を折りたたむ`,
   newTaskIn: label => `${label} に新しいタスク`,
@@ -682,6 +685,7 @@ const zh: KanbanMessages = {
   wontRunTip: '就绪卡片只有在分配了配置档后才会运行。打开卡片设置负责人，或在编排设置中配置默认负责人。',
   noHeartbeat: '无心跳',
   deliveryPending: '交付待处理',
+  deliveryAwaitingAcceptance: '已交付 — 等待 Wessam 接受',
   expand: label => `展开 ${label}`,
   collapse: label => `折叠 ${label}`,
   newTaskIn: label => `在 ${label} 新建任务`,
@@ -892,6 +896,7 @@ const zhHant: KanbanMessages = {
   wontRunTip: '就緒卡片只有在指派了設定檔後才會執行。開啟卡片設定負責人，或在編排設定中設定預設負責人。',
   noHeartbeat: '無心跳',
   deliveryPending: '交付待處理',
+  deliveryAwaitingAcceptance: '已交付 — 等待 Wessam 接受',
   expand: label => `展開 ${label}`,
   collapse: label => `摺疊 ${label}`,
   newTaskIn: label => `在 ${label} 新增任務`,

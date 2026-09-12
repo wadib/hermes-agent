@@ -305,6 +305,11 @@ function Card({
               {k.deliveryPending}
             </span>
           )}
+          {task.delivery_state === 'delivered' && (
+            <span className="w-fit rounded bg-sky-500/15 px-1.5 py-0.5 text-[0.625rem] font-semibold tracking-wide text-sky-300">
+              {k.deliveryAwaitingAcceptance}
+            </span>
+          )}
           <CardFooter arc={arc} task={task} />
         </div>
       </ContextMenuTrigger>

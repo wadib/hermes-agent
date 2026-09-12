@@ -88,7 +88,7 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_STATUSES = {
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
-    "delivery_pending", "done", "archived",
+    "delivery_pending", "awaiting_acceptance", "done", "archived",
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
@@ -718,6 +718,9 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # A separate execution grant governs whether work may start; final user
+    # acceptance remains the sole authority for a delivery-required Done write.
+    execution_authorized: bool = True
     # A task that must produce a user-facing delivery receipt before it can be
     # represented as delivered. False preserves legacy/local-task semantics.
     delivery_required: bool = False
@@ -737,6 +740,7 @@ class Task:
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
+            execution_authorized=bool(g("execution_authorized", 1)),
             delivery_required=bool(g("delivery_required")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -859,6 +863,44 @@ class DeliveryReceipt:
 
 
 @dataclass
+class DeliveryOutbox:
+    task_id: str
+    artifact_handle: str
+    state: str
+    platform: Optional[str]
+    conversation_ref: Optional[str]
+    session_ref: Optional[str]
+    native_message_id: Optional[str]
+    created_at: int
+    delivered_at: Optional[int]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "DeliveryOutbox":
+        return cls(
+            task_id=row["task_id"], artifact_handle=row["artifact_handle"], state=row["state"],
+            platform=row["platform"], conversation_ref=row["conversation_ref"],
+            session_ref=row["session_ref"], native_message_id=row["native_message_id"],
+            created_at=int(row["created_at"]), delivered_at=_opt_int(row["delivered_at"]),
+        )
+
+
+@dataclass
+class TaskAcceptance:
+    task_id: str
+    accepted_by: str
+    source: str
+    user_message_ref: Optional[str]
+    accepted_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "TaskAcceptance":
+        return cls(
+            task_id=row["task_id"], accepted_by=row["accepted_by"], source=row["source"],
+            user_message_ref=row["user_message_ref"], accepted_at=int(row["accepted_at"]),
+        )
+
+
+@dataclass
 class Event:
     id: int
     task_id: str
@@ -974,7 +1016,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Explicitly marks work that needs a durable user-facing delivery receipt.
     -- Legacy cards default false and are never inferred retroactively.
-    delivery_required    INTEGER NOT NULL DEFAULT 0
+    delivery_required    INTEGER NOT NULL DEFAULT 0,
+    -- Separate from final acceptance: records whether the work itself is
+    -- authorized to execute. A delivery-required task can be authorized and
+    -- running while still incapable of transitioning to Done.
+    execution_authorized INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1052,6 +1098,30 @@ CREATE TABLE IF NOT EXISTS task_delivery_receipts (
     user_message_ref TEXT,
     recorded_by      TEXT,
     recorded_at      INTEGER NOT NULL
+);
+
+-- One delivery obligation per gated task. A receipt is populated only by the
+-- gateway after a platform send returns a native message id.
+CREATE TABLE IF NOT EXISTS task_delivery_outbox (
+    task_id           TEXT PRIMARY KEY,
+    artifact_handle   TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'pending',
+    platform          TEXT,
+    conversation_ref  TEXT,
+    session_ref       TEXT,
+    native_message_id TEXT,
+    created_at        INTEGER NOT NULL,
+    delivered_at      INTEGER
+);
+
+-- Explicit acceptance is separate from delivery and is the sole authorization
+-- for the final Done transition of delivery-required work.
+CREATE TABLE IF NOT EXISTS task_acceptances (
+    task_id          TEXT PRIMARY KEY,
+    accepted_by      TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    user_message_ref TEXT,
+    accepted_at      INTEGER NOT NULL
 );
 
 -- Subscription from a gateway source (platform + chat + thread) to a
@@ -1273,6 +1343,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None, delivery_required: bool = False,
+    execution_authorized: bool = True,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1372,8 +1443,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract, delivery_required
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, delivery_required,
+                        execution_authorized
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1383,7 +1455,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
-                        1 if delivery_required else 0,
+                        1 if delivery_required else 0, 1 if execution_authorized else 0,
                     ),
                 )
                 for pid in parents:
@@ -1406,6 +1478,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "execution_authorized": bool(execution_authorized),
                     },
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
@@ -1884,11 +1957,29 @@ def delivery_receipts_for(conn: sqlite3.Connection, task_ids: Iterable[str]) -> 
     return {row["task_id"]: DeliveryReceipt.from_row(row) for row in rows}
 
 
+def delivery_outboxes_for(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, DeliveryOutbox]:
+    """Load authoritative delivery receipts for a task batch without an N+1 query."""
+    task_ids = tuple(dict.fromkeys(task_ids))
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"SELECT * FROM task_delivery_outbox WHERE task_id IN ({placeholders})", task_ids,
+    ).fetchall()
+    return {row["task_id"]: DeliveryOutbox.from_row(row) for row in rows}
+
+
 def delivery_state(task: Task, receipt: Optional[DeliveryReceipt] = None) -> str:
-    """Return the displayed delivery state without treating technical completion as acceptance."""
+    """Return displayed delivery state from durable native transport evidence.
+
+    ``task_delivery_receipts`` is a legacy, caller-authored prose record. It
+    remains readable for history but never establishes user-facing delivery.
+    The only delivered state is the task transition written atomically after a
+    gateway/Desktop transport returns its native message id.
+    """
     if not task.delivery_required:
         return "not_required"
-    return "delivered" if receipt is not None and receipt.complete else "pending"
+    return "delivered" if task.status == "awaiting_acceptance" else "pending"
 
 
 def record_delivery_receipt(
@@ -1938,6 +2029,133 @@ def record_delivery_receipt(
             {"artifact_recorded": bool(artifact), "message_recorded": bool(message), "complete": receipt.complete},
         )
     return receipt
+
+
+def get_delivery_outbox(conn: sqlite3.Connection, task_id: str) -> Optional[DeliveryOutbox]:
+    row = conn.execute("SELECT * FROM task_delivery_outbox WHERE task_id = ?", (task_id,)).fetchone()
+    return DeliveryOutbox.from_row(row) if row else None
+
+
+def get_task_acceptance(conn: sqlite3.Connection, task_id: str) -> Optional[TaskAcceptance]:
+    row = conn.execute("SELECT * FROM task_acceptances WHERE task_id = ?", (task_id,)).fetchone()
+    return TaskAcceptance.from_row(row) if row else None
+
+
+def _enqueue_delivery_outbox(conn: sqlite3.Connection, task_id: str) -> Optional[DeliveryOutbox]:
+    attachments = list_attachments(conn, task_id)
+    if not attachments:
+        return None
+    conn.execute(
+        "INSERT OR IGNORE INTO task_delivery_outbox (task_id, artifact_handle, created_at) VALUES (?, ?, ?)",
+        (task_id, attachments[-1].stored_path, int(time.time())),
+    )
+    return get_delivery_outbox(conn, task_id)
+
+
+def record_outbox_delivery(
+    conn: sqlite3.Connection, task_id: str, *, platform: str, conversation_ref: str,
+    session_ref: Optional[str], native_message_id: str,
+) -> bool:
+    """Write a platform-native persisted delivery receipt, never an acceptance."""
+    if not all(str(value or "").strip() for value in (platform, conversation_ref, native_message_id)):
+        raise ValueError("platform, conversation_ref, and native_message_id are required")
+    now = int(time.time())
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None:
+            return False
+        outbox = get_delivery_outbox(conn, task_id)
+        if outbox is None:
+            return False
+        # A retried notifier can observe the same native receipt after the
+        # status already moved. Preserve the first durable receipt; never
+        # reopen/rewrite it merely to acknowledge a duplicate delivery event.
+        if outbox.state == "delivered":
+            return (outbox.platform, outbox.conversation_ref, outbox.native_message_id) == (
+                platform, conversation_ref, native_message_id)
+        if task.status != "delivery_pending":
+            return False
+        cur = conn.execute(
+            "UPDATE task_delivery_outbox SET state='delivered', platform=?, conversation_ref=?, session_ref=?, "
+            "native_message_id=?, delivered_at=? WHERE task_id=? AND state='pending'",
+            (platform, conversation_ref, session_ref or None, native_message_id, now, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute("UPDATE tasks SET status='awaiting_acceptance' WHERE id=? AND status='delivery_pending'", (task_id,))
+        _append_event(conn, task_id, "delivery_recorded", {
+            "platform": platform, "conversation_ref": conversation_ref, "session_ref": session_ref or None,
+            "native_message_id": native_message_id, "artifact_handle": outbox.artifact_handle,
+        })
+    return True
+
+
+def accept_delivery_from_gateway(
+    conn: sqlite3.Connection, task_id: str, *, platform: str, chat_id: str,
+    thread_id: Optional[str], user_id: Optional[str], user_id_alt: Optional[str],
+    inbound_message_id: str,
+) -> bool:
+    """Accept only from the authenticated gateway source that received delivery.
+
+    The caller supplies values taken from a normalized, already-authorized
+    ``MessageEvent``; this function independently binds them to the persisted
+    subscription and outbound receipt before allowing ``done``.
+    """
+    values = (platform, chat_id, inbound_message_id)
+    if not all(str(value or "").strip() for value in values):
+        return False
+    platform, chat_id, inbound_message_id = (str(value).strip() for value in values)
+    thread_id = str(thread_id or "")
+    user_id = str(user_id or "") or None
+    user_id_alt = str(user_id_alt or "") or None
+    now = int(time.time())
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        outbox = get_delivery_outbox(conn, task_id)
+        if task is None or task.status != "awaiting_acceptance" or outbox is None or outbox.state != "delivered":
+            return False
+        if (outbox.platform or "").lower() != platform.lower() or outbox.conversation_ref != chat_id:
+            return False
+        sub = conn.execute(
+            "SELECT user_id, user_id_alt FROM kanban_notify_subs "
+            "WHERE task_id = ? AND LOWER(platform) = LOWER(?) AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id),
+        ).fetchone()
+        if sub is None or not (user_id or user_id_alt):
+            return False
+        allowed_ids = {str(value) for value in (sub["user_id"], sub["user_id_alt"]) if value}
+        if not allowed_ids.intersection({value for value in (user_id, user_id_alt) if value}):
+            return False
+        if get_task_acceptance(conn, task_id) is not None:
+            return False
+        message_ref = f"{platform}:{chat_id}:{inbound_message_id}"
+        conn.execute(
+            "INSERT INTO task_acceptances (task_id, accepted_by, source, user_message_ref, accepted_at) VALUES (?, ?, ?, ?, ?)",
+            (task_id, user_id or user_id_alt or "gateway-user", "gateway_authenticated_inbound", message_ref, now),
+        )
+        if conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=? AND status='awaiting_acceptance'", (now, task_id),
+        ).rowcount != 1:
+            return False
+        _append_event(conn, task_id, "accepted", {
+            "accepted_by": user_id or user_id_alt, "source": "gateway_authenticated_inbound",
+            "user_message_ref": message_ref,
+        })
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    return True
+
+
+def accept_delivery(
+    conn: sqlite3.Connection, task_id: str, *, accepted_by: str, source: str,
+    user_message_ref: Optional[str] = None,
+) -> bool:
+    """Deprecated raw acceptance API: fail closed.
+
+    Only trusted ingress may write an acceptance because caller-provided names
+    and message references are not authority evidence.
+    """
+    raise ValueError("acceptance requires trusted gateway or desktop ingress")
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
@@ -2254,6 +2472,11 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None or not task.execution_authorized:
+            if task is not None:
+                _append_event(conn, task_id, "claim_rejected", {"reason": "execution_not_authorized"})
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2287,6 +2510,11 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None or not task.execution_authorized:
+            if task is not None:
+                _append_event(conn, task_id, "claim_rejected", {"reason": "execution_not_authorized"})
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2666,8 +2894,18 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    # Preserve declared scratch artifacts before deciding whether this handoff
+    # has a deliverable. `kanban_complete(artifacts=[...])` is the worker's
+    # public way to supply its first attachment; checking first would make that
+    # advertised path impossible for delivery-required work.
+    if isinstance(metadata, dict):
+        _stage_completion_artifacts(conn, task_id, metadata, now)
     task = get_task(conn, task_id)
     delivery_required = bool(task and task.delivery_required)
+    # A delivery-required task without a durable attachment cannot enter a
+    # pending state: there is nothing the notifier can prove it delivered.
+    if delivery_required and not list_attachments(conn, task_id):
+        return False
     acceptance = None if delivery_required else prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2700,8 +2938,8 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
-        if isinstance(metadata, dict):
-            _stage_completion_artifacts(conn, task_id, metadata, now)
+        if delivery_required:
+            _enqueue_delivery_outbox(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="delivery_pending" if delivery_required else "completed",

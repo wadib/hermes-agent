@@ -27,6 +27,19 @@ export interface KanbanTask {
   delivery_required?: boolean
   delivery_state?: 'not_required' | 'pending' | 'delivered'
   delivery_receipt?: null | DeliveryReceipt
+  /** Native transport receipt; the backend, not the renderer, is authoritative. */
+  delivery_outbox?: null | DeliveryOutbox
+}
+
+export interface DeliveryOutbox {
+  artifact_handle: string
+  state: 'pending' | 'delivered'
+  platform?: null | string
+  conversation_ref?: null | string
+  session_ref?: null | string
+  native_message_id?: null | string
+  created_at: number
+  delivered_at?: null | number
 }
 
 export interface DeliveryReceipt {
@@ -234,6 +247,8 @@ export const COLUMN_META: Record<string, { codicon: string; tone: string }> = {
   running: { codicon: 'sync', tone: '#34d399' },
   blocked: { codicon: 'error', tone: '#f87171' },
   review: { codicon: 'eye', tone: '#fbbf24' },
+  delivery_pending: { codicon: 'package', tone: '#f97316' },
+  awaiting_acceptance: { codicon: 'pass-filled', tone: '#38bdf8' },
   done: { codicon: 'pass', tone: 'var(--ui-text-tertiary)' },
   archived: { codicon: 'archive', tone: 'var(--ui-text-quaternary)' }
 }

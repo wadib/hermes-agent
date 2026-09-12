@@ -1135,6 +1135,51 @@ class GatewayInboundMixin:
             _reply = await self._hm_slash_confirm_reply(event, _quick_key)
         return _reply
 
+    async def _hm_kanban_acceptance_command(
+        self, event: "MessageEvent", source: SessionSource,
+    ) -> Optional[str]:
+        """Settle explicit ``/accept <task-id>`` from its authenticated inbound source.
+
+        This deliberately runs after normal gateway admission and before generic
+        slash dispatch. The DB rechecks the exact subscription and native delivery
+        receipt, so neither text similarity nor a dashboard/model call can create
+        acceptance evidence.
+        """
+        if event.get_command() != "accept":
+            return None
+        task_id = (event.get_command_args() or "").strip()
+        if not task_id or any(char.isspace() for char in task_id):
+            return "Usage: /accept <kanban-task-id>"
+        inbound_message_id = str(event.message_id or source.message_id or "").strip()
+        if not inbound_message_id:
+            return "Acceptance refused: this platform did not provide a durable inbound message ID."
+        platform = getattr(source.platform, "value", str(source.platform)).lower()
+
+        def _accept() -> Optional[str]:
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+
+            for meta in kb.list_boards(include_archived=False):
+                board = meta.get("slug")
+                if not board:
+                    continue
+                conn = kbc.connect(board=board)
+                try:
+                    if kb.accept_delivery_from_gateway(
+                        conn, task_id, platform=platform, chat_id=source.chat_id,
+                        thread_id=source.thread_id, user_id=source.user_id,
+                        user_id_alt=source.user_id_alt, inbound_message_id=inbound_message_id,
+                    ):
+                        return str(board)
+                finally:
+                    conn.close()
+            return None
+
+        board = await asyncio.to_thread(_accept)
+        if board is None:
+            return "Acceptance refused: no delivered task matched this authenticated delivery route."
+        return f"✓ Accepted {task_id}; it is now Done on board {board}."
+
     async def _hm_dispatch_idle_commands(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Tuple[bool, Optional[str]]:
@@ -1207,6 +1252,10 @@ class GatewayInboundMixin:
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply
+
+        _acceptance_reply = await self._hm_kanban_acceptance_command(event, source)
+        if _acceptance_reply is not None:
+            return _acceptance_reply
 
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)

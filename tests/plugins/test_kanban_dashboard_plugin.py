@@ -223,21 +223,64 @@ def test_task_detail_includes_links_and_events(client):
 
 
 
-def test_dashboard_completion_cannot_bypass_delivery_pending(client):
+def test_dashboard_completion_cannot_bypass_required_artifact_or_delivery(client):
     task = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "deliver report", "delivery_required": True},
     ).json()["task"]
     task_id = task["id"]
 
-    # PATCH is a direct completion path, but cannot write Done for gated work.
+    # PATCH is a direct completion path: missing durable artifact is rejected
+    # rather than leaving an impossible delivery-pending task behind.
     response = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "done"})
-    assert response.status_code == 200, response.text
-    pending = response.json()["task"]
-    assert pending["status"] == "delivery_pending"
-    assert pending["delivery_state"] == "pending"
-    assert pending["delivery_receipt"] is None
+    assert response.status_code == 409, response.text
+    assert client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]["status"] == "ready"
 
+
+
+def test_dashboard_accept_delivery_cannot_forge_user_acceptance(client, tmp_path):
+    """REST input has no verified user identity, so it cannot authorize Done."""
+    artifact = tmp_path / "receipt.txt"
+    artifact.write_text("proof", encoding="utf-8")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="waiting for Wessam", delivery_required=True)
+        kb.add_attachment(conn, task_id, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
+        assert kb.complete_task(conn, task_id, summary="technical complete")
+        assert kb.record_outbox_delivery(
+            conn, task_id, platform="telegram", conversation_ref="chat-1", session_ref="s-1", native_message_id="m-1",
+        )
+
+    response = client.post(f"/api/plugins/kanban/tasks/{task_id}/accept-delivery", json={"user_message_ref": "forged"})
+    assert response.status_code == 409
+    assert client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]["status"] == "awaiting_acceptance"
+
+
+def test_dashboard_renders_awaiting_acceptance_as_a_distinct_lane(client, tmp_path):
+    """Persisted delivery must never be mis-bucketed as todo or done in the board API."""
+    artifact = tmp_path / "receipt.txt"
+    artifact.write_text("proof", encoding="utf-8")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="waiting for Wessam", delivery_required=True)
+        kb.add_attachment(conn, task_id, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
+        assert kb.complete_task(conn, task_id, summary="technical complete")
+        assert kb.record_outbox_delivery(
+            conn, task_id, platform="telegram", conversation_ref="chat-1", session_ref="s-1", native_message_id="m-1",
+        )
+
+    columns = {column["name"]: column["tasks"] for column in client.get("/api/plugins/kanban/board").json()["columns"]}
+    delivered = columns["awaiting_acceptance"][0]
+    assert delivered["id"] == task_id
+    assert delivered["delivery_state"] == "delivered"
+    assert delivered["delivery_outbox"] == {
+        "artifact_handle": str(artifact),
+        "state": "delivered",
+        "platform": "telegram",
+        "conversation_ref": "chat-1",
+        "session_ref": "s-1",
+        "native_message_id": "m-1",
+        "created_at": delivered["delivery_outbox"]["created_at"],
+        "delivered_at": delivered["delivery_outbox"]["delivered_at"],
+    }
 
 
 def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):

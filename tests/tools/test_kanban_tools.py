@@ -46,12 +46,14 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
 
 @pytest.fixture
 def worker_env(monkeypatch, tmp_path):
-    """Simulate being a worker: HERMES_HOME isolated, HERMES_KANBAN_TASK set
-    after we've created the task."""
+    """Simulate a worker with a persistent gateway origin."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "test-chat")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "test-user")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
@@ -994,79 +996,56 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     assert subs[0]["delivery_mode"] == "notify"
 
 
-def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
-    """CLI / cron / test sessions have no persistent delivery channel.
-    _maybe_auto_subscribe returns False and no row is written."""
+def test_create_rejects_agent_without_persistent_origin(monkeypatch, worker_env):
+    """Agent-created work must never escape its originating conversation."""
     from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
-    out = kt._handle_create({
-        "title": "no sub cli",
-        "assignee": "peer",
-    })
-    d = json.loads(out)
-    assert d["ok"] is True
-    assert d["subscribed"] is False, d
+    out = kt._handle_create({"title": "originless agent work", "assignee": "peer"})
+    assert "error" in json.loads(out)
 
-    assert _list_subs_for_task(d["task_id"]) == []
+    with kbc.connect() as conn:
+        assert [task.id for task in kb.list_tasks(conn) if task.title == "originless agent work"] == []
 
 
-def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
-    """The config gate kanban.auto_subscribe_on_create=false must
-    suppress auto-subscription even when the session has a delivery
-    channel. This is the knob that addresses the upstream design
-    concern from PR #19718 (reverted in #19721) — users who want
-    explicit kanban_notify-subscribe calls per task get that."""
-    # worker_env already created <tmp>/.hermes; use a fresh sibling
-    # home to avoid mkdir() colliding with the worker's directory.
+def test_create_rejects_disabled_origin_subscription(monkeypatch, worker_env, tmp_path):
+    """The agent path fails closed when configuration disables its origin route."""
     home = tmp_path / "gate-home" / ".hermes"
     home.mkdir(parents=True)
-    (home / "config.yaml").write_text(
-        "kanban:\n  auto_subscribe_on_create: false\n"
-    )
+    (home / "config.yaml").write_text("kanban:\n  auto_subscribe_on_create: false\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 
     from tools import kanban_tools as kt
-    out = kt._handle_create({
-        "title": "no sub gated",
-        "assignee": "peer",
-    })
-    d = json.loads(out)
-    assert d["ok"] is True
-    assert d["subscribed"] is False, d
+    out = json.loads(kt._handle_create({"title": "no sub gated", "assignee": "peer"}))
+    assert "error" in out
 
-    assert _list_subs_for_task(d["task_id"]) == []
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    with kbc.connect() as conn:
+        assert [t for t in kb.list_tasks(conn) if t.title == "no sub gated"] == []
 
 
-def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
-    """If add_notify_sub itself raises (e.g. DB locked, schema drift),
-    _maybe_auto_subscribe must NOT bubble that up and fail the parent
-    kanban_create. The function returns False and the parent create
-    still succeeds with subscribed=False."""
+def test_create_rolls_back_when_origin_subscription_write_fails(monkeypatch, worker_env):
+    """A failed origin write rolls the task insert back atomically."""
     from tools import kanban_tools as kt
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-
-    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
 
-    def _boom(*a, **kw):
-        raise RuntimeError("simulated DB failure")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setattr(kbn, "add_notify_sub", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated DB failure")))
 
-    monkeypatch.setattr(kbn, "add_notify_sub", _boom)
-
-    out = kt._handle_create({
-        "title": "auto-sub tolerates add_notify_sub failure",
-        "assignee": "peer",
-    })
-    d = json.loads(out)
-    assert d["ok"] is True, d
-    assert d["subscribed"] is False, d
+    out = json.loads(kt._handle_create({"title": "subscription write failure", "assignee": "peer"}))
+    assert "error" in out
+    with kbc.connect() as conn:
+        assert [t for t in kb.list_tasks(conn) if t.title == "subscription write failure"] == []
 
 
 # ---------------------------------------------------------------------------

@@ -811,6 +811,9 @@ _LATER_TASK_COLUMNS = (
     ("completion_contract", "completion_contract TEXT"),
     # Existing cards are intentionally not upgraded into delivery-required work.
     ("delivery_required", "delivery_required INTEGER NOT NULL DEFAULT 0"),
+    # Historical cards were already created under the pre-existing execution
+    # lifecycle, so migration preserves their runnable authority.
+    ("execution_authorized", "execution_authorized INTEGER NOT NULL DEFAULT 1"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),

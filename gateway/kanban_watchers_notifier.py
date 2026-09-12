@@ -30,7 +30,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "delivery_pending")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -357,6 +357,9 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
+    "delivery_pending": lambda ev, n: (
+        f"📦 {n.head} delivering verified artifact — {n.title}", None, None,
+    ),
     # Re-blocked for the same cause past the limit and routed to `triage` for a
     # human. It emits no blocked/status event, so ping loudly here.
     "block_loop_detected": lambda ev, n: (
@@ -422,6 +425,66 @@ class _KanbanNotification:
 
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
+
+    async def _deliver_required_artifact(self) -> None:
+        """Upload the one outbox artifact, then persist the native upload id.
+
+        The outbound send remains at-least-once across a process crash, but the
+        durable outbox receipt is checked before every retry so repeated events
+        and post-send cursor retries never create a second upload.
+        """
+        def load_outbox():
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+
+            conn = kbc.connect(board=self.board_slug)
+            try:
+                return kb.get_task(conn, self.task_id), kb.get_delivery_outbox(conn, self.task_id)
+            finally:
+                conn.close()
+
+        task, outbox = await _to_thread_process_service(load_outbox)
+        if task is None or outbox is None:
+            raise RuntimeError("delivery-required task has no durable outbox obligation")
+        if outbox.state == "delivered":
+            return
+        if task.status != "delivery_pending":
+            return
+        from gateway.platforms.base import BasePlatformAdapter
+
+        paths = BasePlatformAdapter.filter_local_delivery_paths([outbox.artifact_handle])
+        if len(paths) != 1 or not Path(paths[0]).is_file():
+            raise RuntimeError("delivery artifact is missing or outside approved upload roots")
+        metadata = self.sub.get("delivery_metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        if self.sub.get("thread_id") and not metadata.get("thread_id"):
+            metadata["thread_id"] = self.sub["thread_id"]
+        result = await self.adapter.send_document(
+            chat_id=self.sub["chat_id"], file_path=paths[0], metadata=metadata,
+        )
+        if getattr(result, "success", False) is not True or not getattr(result, "message_id", None):
+            raise RuntimeError("artifact upload did not return a persisted native message id")
+
+        def persist_receipt():
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+
+            conn = kbc.connect(board=self.board_slug)
+            try:
+                return kb.record_outbox_delivery(
+                    conn, self.task_id, platform=self.platform_str,
+                    conversation_ref=str(self.sub["chat_id"]),
+                    session_ref=getattr(task, "session_id", None), native_message_id=str(result.message_id),
+                )
+            finally:
+                conn.close()
+
+        if not await _to_thread_process_service(persist_receipt):
+            raise RuntimeError("native artifact upload could not be persisted as the delivery receipt")
+
+    async def _ensure_delivery_receipt(self, ev: Any) -> None:
+        if ev.kind == "delivery_pending" and self.task and self.task.delivery_required:
+            await self._deliver_required_artifact()
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
         """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
@@ -570,6 +633,7 @@ class _KanbanNotification:
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
             try:
+                await self._ensure_delivery_receipt(ev)
                 await self._send_event(ev, msg)
                 await _to_thread_process_service(partial(
                     self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,

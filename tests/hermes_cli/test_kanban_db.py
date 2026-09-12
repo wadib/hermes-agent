@@ -172,10 +172,13 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 
 
-def test_delivery_required_completion_enters_delivery_pending_without_done(kanban_home):
+def test_delivery_required_completion_enters_delivery_pending_without_done(kanban_home, tmp_path):
     """A worker handoff cannot write Done before delivery and user acceptance."""
+    artifact = tmp_path / "deliverable.txt"
+    artifact.write_text("evidence", encoding="utf-8")
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="deliverable", delivery_required=True)
+        kb.add_attachment(conn, tid, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
 
         # This is the direct DB bypass every CLI/tool/API completion path reaches.
         assert kb.complete_task(conn, tid, summary="technical completion")
@@ -206,7 +209,67 @@ def test_delivery_receipt_remains_pending_until_both_proofs_exist(kanban_home):
             conn, tid, user_message_ref="session:s_123/message:m_456", recorded_by="hermes",
         )
         assert complete.complete is True
-        assert kb.delivery_state(task, complete) == "delivered"
+        # Historical receipt prose remains readable, but it is not native
+        # transport evidence and must never render a task as delivered.
+        assert kb.delivery_state(task, complete) == "pending"
+
+
+def test_delivery_required_completion_stages_worker_artifact_before_gate(kanban_home):
+    """The public worker artifact path can supply a gated task's first attachment."""
+    scratch = kanban_home / "kanban" / "workspaces" / "delivery-artifact"
+    scratch.mkdir(parents=True)
+    artifact = scratch / "evidence.txt"
+    artifact.write_text("verified", encoding="utf-8")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="stage first artifact", delivery_required=True,
+            workspace_kind="scratch", workspace_path=str(scratch),
+        )
+        assert kb.complete_task(conn, task_id, summary="technical handoff", metadata={"artifacts": [str(artifact)]})
+        outbox = kb.get_delivery_outbox(conn, task_id)
+        assert outbox is not None
+        assert Path(outbox.artifact_handle).is_file()
+        assert kb.get_task(conn, task_id).status == "delivery_pending"
+
+
+def test_execution_authorization_is_separate_from_delivery_acceptance(kanban_home):
+    """Work authorization controls dispatch; final delivery acceptance remains a later gate."""
+    with kbc.connect() as conn:
+        authorized = kb.create_task(conn, title="authorized", delivery_required=True)
+        held = kb.create_task(conn, title="not authorized", execution_authorized=False)
+        assert kb.get_task(conn, authorized).execution_authorized is True
+        assert kb.get_task(conn, held).execution_authorized is False
+        assert kb.claim_task(conn, held) is None
+        assert kb.get_task(conn, held).status == "ready"
+        assert kb.list_events(conn, held)[-1].payload == {"reason": "execution_not_authorized"}
+
+
+def test_delivery_required_completion_rejects_missing_artifact(kanban_home):
+    """A required-delivery handoff cannot create an undeliverable pending state."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="missing artifact", delivery_required=True)
+        assert not kb.complete_task(conn, task_id, summary="technical handoff")
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.get_delivery_outbox(conn, task_id) is None
+
+
+def test_delivery_required_completion_stages_declared_scratch_artifact_before_gate(kanban_home):
+    """A worker's declared scratch artifact becomes the durable delivery obligation."""
+    workspace = Path(kb.workspaces_root()) / "t_delivery_artifact"
+    workspace.mkdir(parents=True)
+    artifact = workspace / "report.txt"
+    artifact.write_text("verified artifact", encoding="utf-8")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="staged deliverable", delivery_required=True,
+            workspace_kind="scratch", workspace_path=str(workspace),
+        )
+        assert kb.list_attachments(conn, task_id) == []
+        assert kb.complete_task(conn, task_id, summary="technical handoff", metadata={"artifacts": [str(artifact)]})
+        outbox = kb.get_delivery_outbox(conn, task_id)
+        assert outbox is not None
+        assert Path(outbox.artifact_handle).is_file()
+        assert kb.get_task(conn, task_id).status == "delivery_pending"
 
 
 def test_legacy_task_loads_without_delivery_receipt_requirement(tmp_path):
@@ -240,11 +303,83 @@ def test_legacy_task_loads_without_delivery_receipt_requirement(tmp_path):
         assert kb.delivery_state(task) == "not_required"
 
 
+def test_legacy_db_gets_delivery_gate_tables(tmp_path):
+    """The new required-delivery authority tables must migrate without data loss."""
+    db_path = tmp_path / "legacy-delivery.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT,
+            status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT, created_at INTEGER NOT NULL, started_at INTEGER,
+            completed_at INTEGER, workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT, claim_lock TEXT, claim_expires INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+            kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('legacy', 'old', 'done', 1)")
+    conn.commit()
+    conn.close()
+
+    with kbc.connect(db_path) as migrated:
+        tables = {row["name"] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {"task_delivery_outbox", "task_acceptances"} <= tables
+        assert migrated.execute("SELECT title FROM tasks WHERE id = 'legacy'").fetchone()["title"] == "old"
 
 
-# ---------------------------------------------------------------------------
-# Links + dependency resolution
-# ---------------------------------------------------------------------------
+def test_delivery_outbox_requires_persisted_delivery_and_explicit_acceptance(kanban_home, tmp_path):
+    """No delivery-required dependency unlocks before real receipt plus acceptance."""
+    artifact = tmp_path / "evidence.txt"
+    artifact.write_text("verified artifact", encoding="utf-8")
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="gated delivery", delivery_required=True)
+        child = kb.create_task(conn, title="downstream", parents=[parent])
+        kb.add_attachment(
+            conn, parent, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size,
+        )
+
+        assert kb.complete_task(conn, parent, summary="technical handoff")
+        assert kb.get_task(conn, parent).status == "delivery_pending"
+        outbox = kb.get_delivery_outbox(conn, parent)
+        assert outbox is not None and outbox.artifact_handle == str(artifact)
+        assert outbox.state == "pending"
+        assert kb.get_task(conn, child).status == "todo"
+
+        with pytest.raises(ValueError, match="trusted gateway or desktop ingress"):
+            kb.accept_delivery(
+                conn, parent, accepted_by="Wessam", source="authorized_operation",
+                user_message_ref="session:s_1/message:user_1",
+            )
+        assert kb.record_outbox_delivery(
+            conn, parent, platform="telegram", conversation_ref="chat-1",
+            session_ref="s-1", native_message_id="m_1",
+        )
+        assert kb.get_task(conn, parent).status == "awaiting_acceptance"
+        assert kb.get_task(conn, child).status == "todo"
+
+        from hermes_cli import kanban_db_notify as kbn
+
+        assert not kb.accept_delivery_from_gateway(
+            conn, parent, platform="telegram", chat_id="chat-1", thread_id=None,
+            user_id="other-user", user_id_alt=None, inbound_message_id="inbound-1",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=parent, platform="telegram", chat_id="chat-1", user_id="wessam",
+        )
+        assert kb.accept_delivery_from_gateway(
+            conn, parent, platform="telegram", chat_id="chat-1", thread_id=None,
+            user_id="wessam", user_id_alt=None, inbound_message_id="inbound-1",
+        )
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.get_task_acceptance(conn, parent).user_message_ref == "telegram:chat-1:inbound-1"
+
+
 
 
 
