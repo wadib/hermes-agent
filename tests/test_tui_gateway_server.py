@@ -10170,6 +10170,47 @@ def test_config_set_model_records_per_session_override_not_env(monkeypatch):
         server._sessions.clear()
 
 
+def test_kanban_desktop_accept_rpc_persists_user_row_before_trusted_acceptance(monkeypatch):
+    """The renderer cannot forge an acceptance identity or message reference."""
+    import contextlib
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.kanban_db_connect as kbc
+
+    class SessionDB:
+        def __init__(self): self.rows = []
+        def append_message(self, session_id, role, content, **kwargs):
+            self.rows.append((session_id, role, content, kwargs)); return 73
+
+    session_db = SessionDB()
+    session = _session()
+    session["session_key"] = "desktop-session"
+    server._sessions["desktop-runtime"] = session
+    received = {}
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield session_db
+    @contextlib.contextmanager
+    def fake_connect(*_args, **_kwargs):
+        yield object()
+    def fake_accept(_conn, task_id, *, session_key, user_message_id):
+        received.update(task_id=task_id, session_key=session_key, user_message_id=user_message_id)
+        return True
+
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+    monkeypatch.setattr(kbc, "connect", fake_connect)
+    monkeypatch.setattr(kb, "accept_delivery_from_desktop", fake_accept)
+    try:
+        response = server.handle_request({"id": "accept-1", "method": "kanban.accept_delivery",
+            "params": {"session_id": "desktop-runtime", "task_id": "t_delivery"}})
+        assert response["result"] == {"task_id": "t_delivery", "status": "done", "user_message_id": 73}
+        assert session_db.rows == [("desktop-session", "user", "/accept t_delivery", {
+            "display_kind": "kanban_acceptance", "display_metadata": {"task_id": "t_delivery", "action": "accept_delivery"}})]
+        assert received == {"task_id": "t_delivery", "session_key": "desktop-session", "user_message_id": 73}
+    finally:
+        server._sessions.pop("desktop-runtime", None)
+
+
 def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
     """A /model switch mutates the target session's agent in place and records
     a per-session override; it does NOT write HERMES_MODEL / HERMES_TUI_PROVIDER

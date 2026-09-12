@@ -385,10 +385,27 @@ def test_delivery_outbox_requires_persisted_delivery_and_explicit_acceptance(kan
 
 
 
+def test_desktop_acceptance_binds_exact_tui_session_and_user_row(kanban_home, tmp_path):
+    """Desktop completion cannot be attested by a mismatched session or generic caller."""
+    artifact = tmp_path / "desktop-evidence.txt"
+    artifact.write_text("evidence", encoding="utf-8")
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="desktop delivery", delivery_required=True)
+        kb.add_attachment(conn, task, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
+        assert kb.complete_task(conn, task, summary="ready")
+        from hermes_cli import kanban_db_notify as kbn
+        kbn.add_notify_sub(conn, task_id=task, platform="tui", chat_id="desktop-session")
+        assert kb.record_outbox_delivery(
+            conn, task, platform="tui", conversation_ref="desktop-session",
+            session_ref="desktop-session", native_message_id="delivery-row",
+        )
+        assert not kb.accept_delivery_from_desktop(conn, task, session_key="wrong-session", user_message_id=9)
+        assert kb.get_task(conn, task).status == "awaiting_acceptance"
+        assert kb.accept_delivery_from_desktop(conn, task, session_key="desktop-session", user_message_id=9)
+        assert kb.get_task(conn, task).status == "done"
+        acceptance = kb.get_task_acceptance(conn, task)
+        assert acceptance and acceptance.user_message_ref == "tui:desktop-session:9"
 
-
-# ---------------------------------------------------------------------------
-# Atomic claim (CAS)
 # ---------------------------------------------------------------------------
 
 

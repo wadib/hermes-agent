@@ -798,6 +798,36 @@ _SLASH_BUILTINS = {
     "loop": _cmd_loop, "undo": _cmd_undo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
     "compress": _cmd_compress, "compact": _cmd_compress}
 
+@_rpc("kanban.accept_delivery", 5071, live_session=True)
+def _(rid, params: dict, session: dict) -> dict:
+    """Desktop/TUI-only final acceptance backed by its authenticated live session."""
+    task_id = _str_arg(params, "task_id")
+    if not task_id:
+        return _err(rid, 4063, "task_id required")
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return _err(rid, 4001, "session has no durable key")
+    # The RPC resolver authenticated the live session. Persist an auditable,
+    # user-authored action before touching Kanban; the renderer never supplies
+    # the row id or a claimant identity.
+    with _session_db(session) as db:
+        if db is None:
+            return _err(rid, 5071, "session database unavailable")
+        user_message_id = db.append_message(
+            session_key, "user", f"/accept {task_id}", display_kind="kanban_acceptance",
+            display_metadata={"task_id": task_id, "action": "accept_delivery"},
+        )
+    with _session_profile_runtime_scope(session):
+        kb = _tools_mod("hermes_cli.kanban_db")
+        kbc = _tools_mod("hermes_cli.kanban_db_connect")
+        with kbc.connect() as conn:
+            accepted = kb.accept_delivery_from_desktop(
+                conn, task_id, session_key=session_key, user_message_id=user_message_id)
+    if not accepted:
+        return _err(rid, 4009, "delivery cannot be accepted from this session")
+    return _ok(rid, {"task_id": task_id, "status": "done", "user_message_id": user_message_id})
+
+
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
     name, arg = _resolve_name(params.get("name", "").lstrip("/")), params.get("arg", "")

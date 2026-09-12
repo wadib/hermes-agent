@@ -2146,6 +2146,51 @@ def accept_delivery_from_gateway(
     return True
 
 
+def accept_delivery_from_desktop(
+    conn: sqlite3.Connection, task_id: str, *, session_key: str, user_message_id: int,
+) -> bool:
+    """Accept from the authenticated TUI/Desktop RPC ingress only.
+
+    ``session_key`` and ``user_message_id`` are obtained by the live gateway,
+    not submitted by the renderer. The caller persists the user-authored row
+    before calling this function; this DB boundary binds it to the matching
+    durable tui subscription and outbound receipt.
+    """
+    session_key = str(session_key or "").strip()
+    if not session_key or not isinstance(user_message_id, int) or user_message_id <= 0:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        outbox = get_delivery_outbox(conn, task_id)
+        if task is None or task.status != "awaiting_acceptance" or outbox is None or outbox.state != "delivered":
+            return False
+        if (outbox.platform or "").lower() != "tui" or outbox.conversation_ref != session_key:
+            return False
+        sub = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND LOWER(platform)='tui' AND chat_id=?",
+            (task_id, session_key),
+        ).fetchone()
+        if sub is None or get_task_acceptance(conn, task_id) is not None:
+            return False
+        message_ref = f"tui:{session_key}:{user_message_id}"
+        conn.execute(
+            "INSERT INTO task_acceptances (task_id, accepted_by, source, user_message_ref, accepted_at) VALUES (?, ?, ?, ?, ?)",
+            (task_id, session_key, "desktop_authenticated_session", message_ref, now),
+        )
+        if conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=? AND status='awaiting_acceptance'", (now, task_id),
+        ).rowcount != 1:
+            return False
+        _append_event(conn, task_id, "accepted", {
+            "accepted_by": session_key, "source": "desktop_authenticated_session",
+            "user_message_ref": message_ref,
+        })
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    return True
+
+
 def accept_delivery(
     conn: sqlite3.Connection, task_id: str, *, accepted_by: str, source: str,
     user_message_ref: Optional[str] = None,
