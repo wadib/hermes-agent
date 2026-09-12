@@ -40,6 +40,7 @@ type KanbanMessages = {
   wontRun: string
   wontRunTip: string
   noHeartbeat: string
+  deliveryPending: string
   expand: (label: string) => string
   collapse: (label: string) => string
   newTaskIn: (label: string) => string
@@ -80,6 +81,7 @@ type KanbanMessages = {
   parent: string
   noParent: string
   goalMode: string
+  deliveryRequired: string
   creating: string
   createTask: string
   cancel: string
@@ -253,6 +255,7 @@ export const en: KanbanMessages = {
   wontRunTip:
     'Ready cards only run once a profile is assigned. Open the card and set an assignee, or configure a default assignee in orchestration settings.',
   noHeartbeat: 'no heartbeat',
+  deliveryPending: 'DELIVERY PENDING',
   expand: label => `Expand ${label}`,
   collapse: label => `Collapse ${label}`,
   newTaskIn: label => `New task in ${label}`,
@@ -293,6 +296,7 @@ export const en: KanbanMessages = {
   parent: "Parent (blocks until it's done)",
   noParent: '— no parent —',
   goalMode: "Goal mode (worker loops until a judge agrees it's done)",
+  deliveryRequired: 'Require delivery receipt before work is represented as delivered',
   creating: 'Creating…',
   createTask: 'Create task',
   cancel: 'Cancel',
@@ -465,6 +469,7 @@ const ja: KanbanMessages = {
   wontRunTip:
     'Ready のカードはプロフィールが割り当てられて初めて実行されます。カードを開いて担当を設定するか、オーケストレーション設定でデフォルトの担当を設定してください。',
   noHeartbeat: 'ハートビートなし',
+  deliveryPending: '配信保留',
   expand: label => `${label} を展開`,
   collapse: label => `${label} を折りたたむ`,
   newTaskIn: label => `${label} に新しいタスク`,
@@ -505,6 +510,7 @@ const ja: KanbanMessages = {
   parent: '親（完了するまでブロック）',
   noParent: '— 親なし —',
   goalMode: 'ゴールモード（ジャッジが完了と認めるまでワーカーがループ）',
+  deliveryRequired: '作業を配信済みとして表示する前に配信証明を必須にする',
   creating: '作成中…',
   createTask: 'タスクを作成',
   cancel: 'キャンセル',
@@ -675,6 +681,7 @@ const zh: KanbanMessages = {
   wontRun: '不会运行',
   wontRunTip: '就绪卡片只有在分配了配置档后才会运行。打开卡片设置负责人，或在编排设置中配置默认负责人。',
   noHeartbeat: '无心跳',
+  deliveryPending: '交付待处理',
   expand: label => `展开 ${label}`,
   collapse: label => `折叠 ${label}`,
   newTaskIn: label => `在 ${label} 新建任务`,
@@ -715,6 +722,7 @@ const zh: KanbanMessages = {
   parent: '父任务（完成前会阻塞）',
   noParent: '— 无父任务 —',
   goalMode: '目标模式（工作单元循环直到评判代理认可完成）',
+  deliveryRequired: '在工作显示为已交付前要求交付凭证',
   creating: '创建中…',
   createTask: '创建任务',
   cancel: '取消',
@@ -883,6 +891,7 @@ const zhHant: KanbanMessages = {
   wontRun: '不會執行',
   wontRunTip: '就緒卡片只有在指派了設定檔後才會執行。開啟卡片設定負責人，或在編排設定中設定預設負責人。',
   noHeartbeat: '無心跳',
+  deliveryPending: '交付待處理',
   expand: label => `展開 ${label}`,
   collapse: label => `摺疊 ${label}`,
   newTaskIn: label => `在 ${label} 新增任務`,
@@ -923,6 +932,7 @@ const zhHant: KanbanMessages = {
   parent: '父任務（完成前會阻擋）',
   noParent: '— 無父任務 —',
   goalMode: '目標模式（工作單元循環直到評判代理認可完成）',
+  deliveryRequired: '工作顯示為已交付前必須有交付證明',
   creating: '建立中…',
   createTask: '建立任務',
   cancel: '取消',

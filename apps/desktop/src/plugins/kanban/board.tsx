@@ -300,6 +300,11 @@ function Card({
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
+          {task.delivery_state === 'pending' && (
+            <span className="w-fit rounded bg-destructive/15 px-1.5 py-0.5 text-[0.625rem] font-semibold tracking-wide text-destructive">
+              {k.deliveryPending}
+            </span>
+          )}
           <CardFooter arc={arc} task={task} />
         </div>
       </ContextMenuTrigger>
@@ -574,6 +579,7 @@ function NewTaskDialog({
   const [parent, setParent] = useState('')
   const [modelOverride, setModelOverride] = useState<TaskModelOverride>(EMPTY_OVERRIDE)
   const [goalMode, setGoalMode] = useState(false)
+  const [deliveryRequired, setDeliveryRequired] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<null | string>(null)
   const [estimate, setEstimate] = useState<null | TaskEstimate>(null)
@@ -607,6 +613,7 @@ function NewTaskDialog({
       setParent('')
       setModelOverride(EMPTY_OVERRIDE)
       setGoalMode(false)
+      setDeliveryRequired(false)
       setError(null)
       setBusy(false)
       setEstimate(null)
@@ -634,6 +641,7 @@ function NewTaskDialog({
       const { task, warning } = await createTask({
         assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
         body: bodyText.trim() || undefined,
+        delivery_required: deliveryRequired,
         goal_mode: goalMode,
         parents: parent ? [parent] : undefined,
         priority: Number(priority) || 0,
@@ -781,6 +789,10 @@ function NewTaskDialog({
           <label className="flex cursor-pointer items-center gap-2 text-[0.75rem] text-(--ui-text-secondary)">
             <Switch aria-label={k.goalMode} checked={goalMode} onCheckedChange={setGoalMode} size="xs" />
             {k.goalMode}
+          </label>
+          <label className="flex cursor-pointer items-center gap-2 text-[0.75rem] text-(--ui-text-secondary)">
+            <Switch aria-label={k.deliveryRequired} checked={deliveryRequired} onCheckedChange={setDeliveryRequired} size="xs" />
+            {k.deliveryRequired}
           </label>
 
           {error && <span className="text-[0.75rem] text-destructive">{error}</span>}

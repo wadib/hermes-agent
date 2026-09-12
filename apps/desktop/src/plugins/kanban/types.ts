@@ -23,6 +23,18 @@ export interface KanbanTask {
   started_at?: null | number
   worker_pid?: null | number
   last_heartbeat_at?: null | number
+  /** Explicit delivery state, separate from technical completion/review/acceptance. */
+  delivery_required?: boolean
+  delivery_state?: 'not_required' | 'pending' | 'delivered'
+  delivery_receipt?: null | DeliveryReceipt
+}
+
+export interface DeliveryReceipt {
+  artifact_handle?: null | string
+  user_message_ref?: null | string
+  recorded_by?: null | string
+  recorded_at?: null | number
+  complete: boolean
 }
 
 export interface KanbanColumn {

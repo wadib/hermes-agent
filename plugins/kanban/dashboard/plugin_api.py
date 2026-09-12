@@ -171,7 +171,22 @@ BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
-def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) -> dict[str, Any]:
+def _receipt_dict(receipt: Optional[kanban_db.DeliveryReceipt]) -> Optional[dict[str, Any]]:
+    if receipt is None:
+        return None
+    return {
+        "artifact_handle": receipt.artifact_handle,
+        "user_message_ref": receipt.user_message_ref,
+        "recorded_by": receipt.recorded_by,
+        "recorded_at": receipt.recorded_at,
+        "complete": receipt.complete,
+    }
+
+
+def _task_dict(
+    task: kanban_db.Task, *, latest_summary: Optional[str] = None,
+    delivery_receipt: Optional[kanban_db.DeliveryReceipt] = None,
+) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
@@ -180,6 +195,8 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) ->
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
     # Latest non-null run summary (workers hand off via ``task_runs.summary``, not ``tasks.result``).
     d["latest_summary"] = latest_summary
+    d["delivery_state"] = kanban_db.delivery_state(task, delivery_receipt)
+    d["delivery_receipt"] = _receipt_dict(delivery_receipt)
     return d
 
 
@@ -297,9 +314,13 @@ def get_board(
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        receipts = kanban_db.delivery_receipts_for(conn, [t.id for t in tasks])
         for t in tasks:
             full = summary_map.get(t.id)
-            d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+            d = _task_dict(
+                t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
+                delivery_receipt=receipts.get(t.id),
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -351,7 +372,10 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
-        task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
+        task_d = _task_dict(
+            task, latest_summary=kanban_db.latest_summary(conn, task_id),
+            delivery_receipt=kanban_db.get_delivery_receipt(conn, task_id),
+        )
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
@@ -389,6 +413,7 @@ class CreateTaskBody(BaseModel):
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
+    delivery_required: bool = False
 
 
 @router.post("/tasks")
@@ -483,6 +508,24 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         if kanban_db.delete_attachment(conn, attachment_id) is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
+
+
+
+class DeliveryReceiptBody(BaseModel):
+    artifact_handle: Optional[str] = None
+    user_message_ref: Optional[str] = None
+
+
+@router.put("/tasks/{task_id}/delivery-receipt")
+def put_delivery_receipt(task_id: str, payload: DeliveryReceiptBody, board: Optional[str] = Query(None)):
+    """Record one or both explicit delivery proofs; missing proof remains pending."""
+    with _board_conn(board) as (board, conn), _value_error_400():
+        kanban_db.record_delivery_receipt(
+            conn, task_id, artifact_handle=payload.artifact_handle,
+            user_message_ref=payload.user_message_ref, recorded_by="dashboard",
+        )
+        task = _require_task(conn, task_id)
+        return {"task": _task_dict(task, delivery_receipt=kanban_db.get_delivery_receipt(conn, task_id))}
 
 
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------

@@ -792,6 +792,10 @@ export function TaskDrawer({
               </Callout>
             )}
 
+            {task.delivery_state === 'pending' && (
+              <Callout title={k.deliveryPending} tone={SEVERITY_TONE.error} />
+            )}
+
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={k.diagnosticsN(task.diagnostics.length)}>
                 <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />

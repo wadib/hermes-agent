@@ -715,6 +715,9 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # A task that must produce a user-facing delivery receipt before it can be
+    # represented as delivered. False preserves legacy/local-task semantics.
+    delivery_required: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -731,6 +734,7 @@ class Task:
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
+            delivery_required=bool(g("delivery_required")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
 
@@ -825,6 +829,29 @@ class Attachment:
             id=r["id"], task_id=r["task_id"], filename=r["filename"],
             stored_path=r["stored_path"], content_type=r["content_type"],
             size=r["size"] or 0, uploaded_by=r["uploaded_by"], created_at=r["created_at"],
+        )
+
+
+@dataclass
+class DeliveryReceipt:
+    """Durable proof that a required task artifact reached its user-facing chat/session."""
+
+    task_id: str
+    artifact_handle: Optional[str]
+    user_message_ref: Optional[str]
+    recorded_by: Optional[str]
+    recorded_at: int
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.artifact_handle and self.user_message_ref)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "DeliveryReceipt":
+        return cls(
+            task_id=row["task_id"], artifact_handle=row["artifact_handle"],
+            user_message_ref=row["user_message_ref"], recorded_by=row["recorded_by"],
+            recorded_at=int(row["recorded_at"]),
         )
 
 
@@ -941,7 +968,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicitly marks work that needs a durable user-facing delivery receipt.
+    -- Legacy cards default false and are never inferred retroactively.
+    delivery_required    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1011,6 +1041,14 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_delivery_receipts (
+    task_id          TEXT PRIMARY KEY,
+    artifact_handle  TEXT,
+    user_message_ref TEXT,
+    recorded_by      TEXT,
+    recorded_at      INTEGER NOT NULL
 );
 
 -- Subscription from a gateway source (platform + chat + thread) to a
@@ -1231,7 +1269,7 @@ def create_task(
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
-    completion_contract: Optional[str] = None,
+    completion_contract: Optional[str] = None, delivery_required: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1331,8 +1369,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, delivery_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1342,6 +1380,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if delivery_required else 0,
                     ),
                 )
                 for pid in parents:
@@ -1824,6 +1863,78 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         if p.is_file():
             p.unlink()
     return att
+
+
+def get_delivery_receipt(conn: sqlite3.Connection, task_id: str) -> Optional[DeliveryReceipt]:
+    row = conn.execute("SELECT * FROM task_delivery_receipts WHERE task_id = ?", (task_id,)).fetchone()
+    return DeliveryReceipt.from_row(row) if row else None
+
+
+def delivery_receipts_for(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, DeliveryReceipt]:
+    task_ids = tuple(dict.fromkeys(task_ids))
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"SELECT * FROM task_delivery_receipts WHERE task_id IN ({placeholders})", task_ids,
+    ).fetchall()
+    return {row["task_id"]: DeliveryReceipt.from_row(row) for row in rows}
+
+
+def delivery_state(task: Task, receipt: Optional[DeliveryReceipt] = None) -> str:
+    """Return the displayed delivery state without treating technical completion as acceptance."""
+    if not task.delivery_required:
+        return "not_required"
+    return "delivered" if receipt is not None and receipt.complete else "pending"
+
+
+def record_delivery_receipt(
+    conn: sqlite3.Connection, task_id: str, *, artifact_handle: Optional[str] = None,
+    user_message_ref: Optional[str] = None, recorded_by: Optional[str] = None,
+) -> DeliveryReceipt:
+    """Merge one or both receipt proofs and append an auditable event.
+
+    Partial receipts are intentional: they remain ``pending`` until both exact
+    fields are present. Empty values are refused so a prior proof is never
+    silently erased.
+    """
+    updates = {
+        key: value.strip() for key, value in (
+            ("artifact_handle", artifact_handle), ("user_message_ref", user_message_ref)
+        ) if value is not None
+    }
+    if not updates:
+        raise ValueError("artifact_handle or user_message_ref is required")
+    if any(not value for value in updates.values()):
+        raise ValueError("delivery receipt fields must not be blank")
+    now = int(time.time())
+    with write_txn(conn):
+        _require_task(conn, task_id)
+        task = get_task(conn, task_id)
+        if task is None or not task.delivery_required:
+            raise ValueError("task does not require a delivery receipt")
+        current = get_delivery_receipt(conn, task_id)
+        artifact = updates.get("artifact_handle", current.artifact_handle if current else None)
+        message = updates.get("user_message_ref", current.user_message_ref if current else None)
+        conn.execute(
+            """
+            INSERT INTO task_delivery_receipts
+                (task_id, artifact_handle, user_message_ref, recorded_by, recorded_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                artifact_handle=excluded.artifact_handle,
+                user_message_ref=excluded.user_message_ref,
+                recorded_by=excluded.recorded_by,
+                recorded_at=excluded.recorded_at
+            """,
+            (task_id, artifact, message, recorded_by, now),
+        )
+        receipt = DeliveryReceipt(task_id, artifact, message, recorded_by, now)
+        _append_event(
+            conn, task_id, "delivery_receipt_recorded",
+            {"artifact_recorded": bool(artifact), "message_recorded": bool(message), "complete": receipt.complete},
+        )
+    return receipt
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
@@ -3512,7 +3623,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in ("task_comments", "task_events", "task_runs", "task_delivery_receipts", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 

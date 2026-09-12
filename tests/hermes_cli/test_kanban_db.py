@@ -170,9 +170,68 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
-# ---------------------------------------------------------------------------
-# Task creation + status inference
-# ---------------------------------------------------------------------------
+
+
+def test_delivery_receipt_remains_pending_until_both_proofs_exist(kanban_home):
+    """Technical completion is never allowed to impersonate user-facing delivery."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deliverable", delivery_required=True)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kb.delivery_state(task) == "pending"
+
+        artifact_only = kb.record_delivery_receipt(
+            conn, tid, artifact_handle="C:/deliverables/report.pdf", recorded_by="relay",
+        )
+        assert artifact_only.complete is False
+        assert kb.delivery_state(task, artifact_only) == "pending"
+
+        complete = kb.record_delivery_receipt(
+            conn, tid, user_message_ref="session:s_123/message:m_456", recorded_by="hermes",
+        )
+        assert complete.complete is True
+        assert kb.delivery_state(task, complete) == "delivered"
+
+        # The lifecycle status remains technical completion; receipt collection
+        # never silently represents a Wessam acceptance.
+        assert kb.complete_task(conn, tid, summary="technical completion")
+        completed = kb.get_task(conn, tid)
+        assert completed is not None and completed.status == "done"
+        assert kb.delivery_state(completed, kb.get_delivery_receipt(conn, tid)) == "delivered"
+        events = [event for event in kb.list_events(conn, tid) if event.kind == "delivery_receipt_recorded"]
+        assert [event.payload["complete"] for event in events] == [False, True]
+
+
+def test_legacy_task_loads_without_delivery_receipt_requirement(tmp_path):
+    """Pre-receipt boards gain the additive default without historical inference."""
+    db_path = tmp_path / "legacy-kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT,
+            status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT, created_at INTEGER NOT NULL, started_at INTEGER,
+            completed_at INTEGER, workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT, claim_lock TEXT, claim_expires INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+            kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('legacy', 'old', 'done', 1)")
+    conn.commit()
+    conn.close()
+
+    with kbc.connect(db_path) as migrated:
+        task = kb.get_task(migrated, "legacy")
+        assert task is not None
+        assert task.delivery_required is False
+        assert kb.get_delivery_receipt(migrated, "legacy") is None
+        assert kb.delivery_state(task) == "not_required"
+
 
 
 

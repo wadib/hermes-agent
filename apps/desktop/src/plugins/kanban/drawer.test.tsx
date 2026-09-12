@@ -127,3 +127,21 @@ describe('task attachment compatibility', () => {
     expect(screen.queryByText(en.noAttachments)).toBeNull()
   })
 })
+
+describe('delivery state', () => {
+  it('renders DELIVERY PENDING for technically completed work without both receipts', async () => {
+    detail = {
+      ...legacyDetail,
+      task: {
+        ...legacyDetail.task,
+        status: 'done',
+        delivery_required: true,
+        delivery_state: 'pending',
+        delivery_receipt: { artifact_handle: 'C:/deliverables/report.pdf', complete: false }
+      }
+    }
+    openDrawer()
+
+    expect(await screen.findByText(en.deliveryPending)).toBeTruthy()
+  })
+})
