@@ -1114,6 +1114,20 @@ CREATE TABLE IF NOT EXISTS task_delivery_outbox (
     delivered_at      INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS task_usable_output_outbox (
+    task_id           TEXT NOT NULL,
+    idempotency_key   TEXT NOT NULL,
+    content           TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'pending',
+    platform          TEXT,
+    conversation_ref  TEXT,
+    session_ref       TEXT,
+    native_message_id TEXT,
+    created_at        INTEGER NOT NULL,
+    delivered_at      INTEGER,
+    PRIMARY KEY (task_id, idempotency_key)
+);
+
 -- Explicit acceptance is separate from delivery and is the sole authorization
 -- for the final Done transition of delivery-required work.
 CREATE TABLE IF NOT EXISTS task_acceptances (
@@ -2034,6 +2048,51 @@ def record_delivery_receipt(
 def get_delivery_outbox(conn: sqlite3.Connection, task_id: str) -> Optional[DeliveryOutbox]:
     row = conn.execute("SELECT * FROM task_delivery_outbox WHERE task_id = ?", (task_id,)).fetchone()
     return DeliveryOutbox.from_row(row) if row else None
+
+
+def publish_usable_output(conn: sqlite3.Connection, task_id: str, *, idempotency_key: str, content: str) -> bool:
+    """Durably queue one useful running-task output without completing the task."""
+    key, body = str(idempotency_key or "").strip(), str(content or "").strip()
+    if not key or not body:
+        raise ValueError("idempotency_key and content are required")
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None or task.status != "running":
+            return False
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO task_usable_output_outbox (task_id, idempotency_key, content, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, key, body, int(time.time())),
+        )
+        if cur.rowcount:
+            _append_event(conn, task_id, "usable_output", {"idempotency_key": key, "content": body[:400]})
+    return True
+
+
+def get_usable_output_outbox(conn: sqlite3.Connection, task_id: str, idempotency_key: str):
+    return conn.execute(
+        "SELECT * FROM task_usable_output_outbox WHERE task_id=? AND idempotency_key=?", (task_id, idempotency_key),
+    ).fetchone()
+
+
+def record_usable_output_delivery(
+    conn: sqlite3.Connection, task_id: str, *, idempotency_key: str, platform: str,
+    conversation_ref: str, session_ref: Optional[str], native_message_id: str,
+) -> bool:
+    """Persist a native usable-output receipt while deliberately leaving task status unchanged."""
+    if not all(str(v or "").strip() for v in (idempotency_key, platform, conversation_ref, native_message_id)):
+        raise ValueError("output key, platform, conversation_ref, and native_message_id are required")
+    with write_txn(conn):
+        row = get_usable_output_outbox(conn, task_id, idempotency_key)
+        task = get_task(conn, task_id)
+        if row is None or task is None or task.status != "running":
+            return False
+        if row["state"] == "delivered":
+            return (row["platform"], row["conversation_ref"], row["native_message_id"]) == (
+                platform, conversation_ref, native_message_id)
+        return conn.execute(
+            "UPDATE task_usable_output_outbox SET state='delivered', platform=?, conversation_ref=?, session_ref=?, native_message_id=?, delivered_at=? WHERE task_id=? AND idempotency_key=? AND state='pending'",
+            (platform, conversation_ref, session_ref or None, native_message_id, int(time.time()), task_id, idempotency_key),
+        ).rowcount == 1
 
 
 def get_task_acceptance(conn: sqlite3.Connection, task_id: str) -> Optional[TaskAcceptance]:

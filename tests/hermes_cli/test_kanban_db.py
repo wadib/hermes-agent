@@ -385,6 +385,25 @@ def test_delivery_outbox_requires_persisted_delivery_and_explicit_acceptance(kan
 
 
 
+def test_usable_output_is_idempotent_and_receipt_keeps_task_running(kanban_home):
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="progress", assignee="worker")
+        assert kb.claim_task(conn, task) is not None
+        assert kb.publish_usable_output(conn, task, idempotency_key="step-1", content="first usable result")
+        assert kb.publish_usable_output(conn, task, idempotency_key="step-1", content="duplicate retry")
+        row = kb.get_usable_output_outbox(conn, task, "step-1")
+        assert row["state"] == "pending" and row["content"] == "first usable result"
+        assert kb.record_usable_output_delivery(
+            conn, task, idempotency_key="step-1", platform="telegram", conversation_ref="chat-1",
+            session_ref="s-1", native_message_id="m-1",
+        )
+        assert kb.get_task(conn, task).status == "running"
+        assert kb.record_usable_output_delivery(
+            conn, task, idempotency_key="step-1", platform="telegram", conversation_ref="chat-1",
+            session_ref="s-1", native_message_id="m-1",
+        )
+        assert kb.get_task(conn, task).status == "running"
+
 def test_desktop_acceptance_binds_exact_tui_session_and_user_row(kanban_home, tmp_path):
     """Desktop completion cannot be attested by a mismatched session or generic caller."""
     artifact = tmp_path / "desktop-evidence.txt"
