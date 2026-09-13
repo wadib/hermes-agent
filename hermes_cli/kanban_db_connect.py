@@ -794,6 +794,7 @@ _RENAMED_TASK_COLUMNS = (
 _LATER_TASK_COLUMNS = (
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
+    ("last_progress_at", "last_progress_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),
     ("workflow_template_id", "workflow_template_id TEXT"),
     ("current_step_key", "current_step_key TEXT"),

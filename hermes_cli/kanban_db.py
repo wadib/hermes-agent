@@ -954,6 +954,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
     last_heartbeat_at    INTEGER,
+    -- Meaningful work advancement (usable output/child result), distinct from liveness.
+    last_progress_at     INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
@@ -2064,6 +2066,7 @@ def publish_usable_output(conn: sqlite3.Connection, task_id: str, *, idempotency
             (task_id, key, body, int(time.time())),
         )
         if cur.rowcount:
+            conn.execute("UPDATE tasks SET last_progress_at=? WHERE id=? AND status='running'", (int(time.time()), task_id))
             _append_event(conn, task_id, "usable_output", {"idempotency_key": key, "content": body[:400]})
     return True
 

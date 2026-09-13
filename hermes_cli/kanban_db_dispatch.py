@@ -501,9 +501,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     return timed_out
 
 
-# A running task with no heartbeat for this long is inactive regardless of
-# ``dispatch_stale_timeout_seconds`` (spec: ">4h started + no commits in 1h").
-_STALE_HEARTBEAT_GAP_SECONDS = 3600
+# Native dispatcher progress watchdog: heartbeats prove liveness, not advancement.
+_STALE_HEARTBEAT_GAP_SECONDS = 60
 
 
 def detect_stale_running(
@@ -529,7 +528,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.last_progress_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -544,8 +543,9 @@ def detect_stale_running(
             continue
 
         last_hb = row["last_heartbeat_at"]
-        hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+        last_progress = row["last_progress_at"] or row["active_started_at"]
+        progress_age = now - int(last_progress)
+        if progress_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue
 
         pid = row["worker_pid"]
@@ -579,7 +579,8 @@ def detect_stale_running(
             payload = {
                 "elapsed_seconds": int(elapsed),
                 "last_heartbeat_at": _kb._opt_int(last_hb),
-                "heartbeat_age_seconds": _kb._opt_int(hb_age),
+                "last_progress_at": _kb._opt_int(row["last_progress_at"]),
+                "progress_age_seconds": int(progress_age),
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
                 "retry_status": retry_status,
@@ -589,11 +590,7 @@ def detect_stale_running(
             run_id = _kb._end_run(
                 conn, tid,
                 outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
+                error=f"no meaningful progress for {int(progress_age)}s after {int(elapsed)}s running",
                 metadata=payload,
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)

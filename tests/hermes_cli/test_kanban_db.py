@@ -385,6 +385,25 @@ def test_delivery_outbox_requires_persisted_delivery_and_explicit_acceptance(kan
 
 
 
+def test_bare_heartbeat_never_resets_meaningful_progress_age(kanban_home, monkeypatch):
+    """Liveness keeps the lease alive but cannot suppress the 60s progress watchdog."""
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="watchdog", assignee="worker")
+        claimed = kb.claim_task(conn, task)
+        assert claimed is not None
+        run_id = kb.get_task(conn, task).current_run_id
+        conn.execute("UPDATE tasks SET started_at=0, last_progress_at=0, last_heartbeat_at=0 WHERE id=?", (task,))
+        conn.execute("UPDATE task_runs SET started_at=0 WHERE id=?", (run_id,))
+        conn.commit()
+        monkeypatch.setattr(kbd.time, "time", lambda: 120)
+        assert kbd.heartbeat_worker(conn, task, expected_run_id=run_id)
+        row = conn.execute("SELECT last_heartbeat_at, last_progress_at FROM tasks WHERE id=?", (task,)).fetchone()
+        assert row["last_heartbeat_at"] == 120
+        assert row["last_progress_at"] == 0
+        assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == [task]
+        event_kinds = [event.kind for event in kb.list_events(conn, task)]
+        assert "stale" in event_kinds
+
 def test_usable_output_is_idempotent_and_receipt_keeps_task_running(kanban_home):
     with kbc.connect() as conn:
         task = kb.create_task(conn, title="progress", assignee="worker")
