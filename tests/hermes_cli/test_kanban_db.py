@@ -170,6 +170,102 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_legacy_multiple_pending_usable_outputs_migrate_losslessly_and_drain_fifo(tmp_path):
+    """Pre-coalescing output rows remain deliverable without defeating new-write coalescing."""
+    db_path = tmp_path / "legacy-multiple-output.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    kbc._migrate_add_optional_columns(conn)
+    task = kb.create_task(conn, title="legacy output")
+    conn.commit()
+    assert kb.claim_task(conn, task) is not None
+    conn.execute("DROP TABLE task_usable_output_outbox")
+    conn.execute("""
+        CREATE TABLE task_usable_output_outbox (
+            task_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            content TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            platform TEXT,
+            conversation_ref TEXT,
+            session_ref TEXT,
+            native_message_id TEXT,
+            send_attempt_token TEXT,
+            send_attempted_at INTEGER,
+            created_at INTEGER NOT NULL,
+            not_before_at INTEGER NOT NULL DEFAULT 0,
+            delivered_at INTEGER,
+            PRIMARY KEY (task_id, idempotency_key)
+        )
+    """)
+    legacy_rows = [
+        ("oldest", "first durable output", 10, "telegram", "chat-a", "session-a"),
+        ("middle", "second durable output", 20, "telegram", "chat-b", "session-b"),
+        ("current", "third durable output", 30, "telegram", "chat-c", "session-c"),
+    ]
+    for key, content, created_at, platform, conversation, session in legacy_rows:
+        conn.execute(
+            "INSERT INTO task_usable_output_outbox "
+            "(task_id, idempotency_key, content, state, platform, conversation_ref, session_ref, created_at, not_before_at) "
+            "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, 0)",
+            (task, key, content, platform, conversation, session, created_at),
+        )
+    conn.commit()
+    conn.close()
+
+    with kbc.connect(db_path) as migrated:
+        preserved = migrated.execute(
+            "SELECT idempotency_key, content, created_at, platform, conversation_ref, session_ref, legacy_pending "
+            "FROM task_usable_output_outbox WHERE task_id=? ORDER BY created_at, rowid",
+            (task,),
+        ).fetchall()
+        assert [tuple(row) for row in preserved] == [
+            ("oldest", "first durable output", 10, "telegram", "chat-a", "session-a", 1),
+            ("middle", "second durable output", 20, "telegram", "chat-b", "session-b", 1),
+            ("current", "third durable output", 30, "telegram", "chat-c", "session-c", 0),
+        ]
+        assert kb.usable_output_ready(migrated, task, "oldest")
+        assert not kb.usable_output_ready(migrated, task, "middle")
+        assert not kb.usable_output_ready(migrated, task, "current")
+        oldest_token = kb.begin_usable_output_send_attempt(migrated, task, "oldest")
+        assert oldest_token
+        assert kb.begin_usable_output_send_attempt(migrated, task, "middle") is None
+        assert kb.mark_usable_output_native_ack(
+            migrated, task, "oldest", send_attempt_token=oldest_token,
+            platform="telegram", conversation_ref="chat-a", thread_id=None,
+            session_ref="session-a", native_message_id="native-oldest",
+        )
+        assert kb.reconcile_usable_output_delivery(
+            migrated, task, "oldest", send_attempt_token=oldest_token,
+        )
+        assert kb.usable_output_ready(migrated, task, "middle")
+        before_repeat = [tuple(row) for row in migrated.execute(
+            "SELECT idempotency_key, content, created_at, platform, conversation_ref, session_ref, legacy_pending "
+            "FROM task_usable_output_outbox WHERE task_id=? ORDER BY created_at, rowid", (task,)
+        )]
+
+    # A repeated initialization must not change preserved data or queue class.
+    kbc.init_db(db_path)
+    with kbc.connect(db_path) as migrated:
+        after_repeat = [tuple(row) for row in migrated.execute(
+            "SELECT idempotency_key, content, created_at, platform, conversation_ref, session_ref, legacy_pending "
+            "FROM task_usable_output_outbox WHERE task_id=? ORDER BY created_at, rowid", (task,)
+        )]
+        assert after_repeat == before_repeat
+        assert kb.publish_usable_output(
+            migrated, task, idempotency_key="future-key", content="coalesced current state",
+        )
+        # New writes coalesce only the newest mutable row; no legacy record is overwritten or removed.
+        rows = migrated.execute(
+            "SELECT idempotency_key, content, legacy_pending FROM task_usable_output_outbox "
+            "WHERE task_id=? ORDER BY created_at, rowid", (task,)
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("oldest", "first durable output", 1),
+            ("middle", "second durable output", 1),
+            ("current", "coalesced current state", 0),
+        ]
 
 
 def test_delivery_required_completion_enters_delivery_pending_without_done(kanban_home, tmp_path):

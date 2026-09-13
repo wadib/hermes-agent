@@ -845,6 +845,9 @@ _USABLE_OUTPUT_OUTBOX_COLUMNS = (
     ("thread_id", "thread_id TEXT"),
     ("send_attempt_token", "send_attempt_token TEXT"),
     ("send_attempted_at", "send_attempted_at INTEGER"),
+    # Historical pending rows are retained and exempted from the future-write
+    # partial unique index rather than deleted during migration.
+    ("legacy_pending", "legacy_pending INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -931,17 +934,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         for name, ddl in _USABLE_OUTPUT_OUTBOX_COLUMNS:
             if name not in output_cols:
                 _add_column_if_missing(conn, "task_usable_output_outbox", name, ddl)
-        # Existing boards may contain multiple pending historical outputs. Keep
-        # the newest one as the explicit current-state record before enforcing
-        # the one-pending invariant.
-        conn.execute(
-            "DELETE FROM task_usable_output_outbox WHERE state='pending' AND rowid NOT IN ("
-            "SELECT MAX(rowid) FROM task_usable_output_outbox WHERE state='pending' GROUP BY task_id)"
-        )
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_usable_output_one_pending "
-            "ON task_usable_output_outbox(task_id) WHERE state='pending'"
-        )
+        # Legacy releases permitted several pending output records for one task.
+        # Keep every row and every receipt/content field: all but the newest
+        # become a FIFO compatibility queue, exempt from the future-write
+        # coalescing index. The newest remains the mutable current-state row.
+        with write_txn(conn):
+            tasks_with_pending = conn.execute(
+                "SELECT DISTINCT task_id FROM task_usable_output_outbox WHERE state='pending'"
+            ).fetchall()
+            for pending_task in tasks_with_pending:
+                rows = conn.execute(
+                    "SELECT rowid FROM task_usable_output_outbox WHERE task_id=? AND state='pending' "
+                    "ORDER BY created_at DESC, rowid DESC",
+                    (pending_task["task_id"],),
+                ).fetchall()
+                if len(rows) > 1:
+                    conn.execute(
+                        "UPDATE task_usable_output_outbox SET legacy_pending=1 "
+                        "WHERE task_id=? AND state='pending' AND rowid != ?",
+                        (pending_task["task_id"], rows[0]["rowid"]),
+                    )
+                if rows:
+                    conn.execute(
+                        "UPDATE task_usable_output_outbox SET legacy_pending=0 WHERE rowid=?",
+                        (rows[0]["rowid"],),
+                    )
+            # This index constrains only post-migration current-state writes;
+            # preserved legacy queue rows are deliberately outside its domain.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_usable_output_one_pending "
+                "ON task_usable_output_outbox(task_id) "
+                "WHERE state='pending' AND legacy_pending=0"
+            )
 
     if _table_exists(conn, "task_runs"):
         _backfill_legacy_inflight_runs(conn)

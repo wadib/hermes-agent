@@ -1151,13 +1151,12 @@ CREATE TABLE IF NOT EXISTS task_usable_output_outbox (
     send_attempted_at INTEGER,
     created_at        INTEGER NOT NULL,
     not_before_at     INTEGER NOT NULL DEFAULT 0,
+    -- Rows preserved from pre-coalescing releases are exempt from the
+    -- future-write one-pending index and drain in created_at/rowid order.
+    legacy_pending    INTEGER NOT NULL DEFAULT 0,
     delivered_at      INTEGER,
     PRIMARY KEY (task_id, idempotency_key)
 );
--- Exactly one mutable, latest-state output waits per task. Delivered rows
--- remain as receipts; a new pending row is held until its durable rate time.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_usable_output_one_pending
-    ON task_usable_output_outbox(task_id) WHERE state = 'pending';
 
 CREATE TABLE IF NOT EXISTS task_mutation_leases (
     scope_kind TEXT NOT NULL,
@@ -2112,7 +2111,7 @@ def publish_usable_output(conn: sqlite3.Connection, task_id: str, *, idempotency
             return False
         pending = conn.execute(
             "SELECT rowid, idempotency_key FROM task_usable_output_outbox "
-            "WHERE task_id=? AND state='pending' ORDER BY rowid DESC LIMIT 1", (task_id,),
+            "WHERE task_id=? AND state='pending' AND legacy_pending=0 ORDER BY rowid DESC LIMIT 1", (task_id,),
         ).fetchone()
         if pending is not None:
             durable_key = str(pending["idempotency_key"])
@@ -2158,12 +2157,27 @@ def get_usable_output_outbox(conn: sqlite3.Connection, task_id: str, idempotency
     ).fetchone()
 
 
+def _usable_output_queue_head(conn: sqlite3.Connection, task_id: str):
+    """Return the oldest unsettled output so preserved legacy rows drain FIFO."""
+    return conn.execute(
+        "SELECT rowid, idempotency_key, state, not_before_at "
+        "FROM task_usable_output_outbox WHERE task_id=? AND state IN ('pending', 'sending') "
+        "ORDER BY created_at ASC, rowid ASC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+
+
 def usable_output_ready(conn: sqlite3.Connection, task_id: str, idempotency_key: str) -> bool:
-    """True when an output may be sent, reconciled, or cursor-settled without waiting."""
+    """True when the FIFO head may be sent, reconciled, or cursor-settled."""
     row = get_usable_output_outbox(conn, task_id, idempotency_key)
     if row is None:
         return False
-    if row["state"] in {"sending", "delivered"}:
+    if row["state"] == "delivered":
+        return True
+    head = _usable_output_queue_head(conn, task_id)
+    if head is None or str(head["idempotency_key"]) != str(idempotency_key):
+        return False
+    if row["state"] == "sending":
         return True
     return row["state"] == "pending" and int(row["not_before_at"] or 0) <= int(time.time())
 
@@ -2179,6 +2193,9 @@ def begin_usable_output_send_attempt(
         task = get_task(conn, task_id)
         if (row is None or task is None or task.status != "running"
                 or row["state"] != "pending" or int(row["not_before_at"] or 0) > now):
+            return None
+        head = _usable_output_queue_head(conn, task_id)
+        if head is None or str(head["idempotency_key"]) != str(idempotency_key):
             return None
         changed = conn.execute(
             "UPDATE task_usable_output_outbox "
