@@ -539,13 +539,25 @@ def detect_stale_running(
         if row["active_started_at"] is None:
             continue
         elapsed = now - int(row["active_started_at"])
-        if elapsed < stale_timeout_seconds:
-            continue
-
         last_hb = row["last_heartbeat_at"]
         last_progress = row["last_progress_at"] or row["active_started_at"]
         progress_age = now - int(last_progress)
         if progress_age < _STALE_HEARTBEAT_GAP_SECONDS:
+            continue
+        # Persist exactly one pre-stall exception per progress epoch. Existing
+        # subscription cursors route this event only to the task's origin; no
+        # healthy tick emits anything and a new useful output starts a new epoch.
+        with _kb.write_txn(conn):
+            seen = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND kind='no_progress_suspected' AND created_at >= ? LIMIT 1",
+                (row["id"], int(last_progress)),
+            ).fetchone()
+            if seen is None:
+                _kb._append_event(conn, row["id"], "no_progress_suspected", {
+                    "progress_age_seconds": int(progress_age), "last_progress_at": _kb._opt_int(row["last_progress_at"]),
+                    "last_heartbeat_at": _kb._opt_int(last_hb),
+                })
+        if elapsed < stale_timeout_seconds:
             continue
 
         pid = row["worker_pid"]

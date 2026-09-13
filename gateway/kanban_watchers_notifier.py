@@ -30,7 +30,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "delivery_pending", "usable_output")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "delivery_pending", "usable_output", "no_progress_suspected", "stale")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -362,6 +362,12 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     ),
     "usable_output": lambda ev, n: (
         f"📤 {n.head} progress output — {_clip(ev, 'content', '{}', 400)}", None, None,
+    ),
+    "no_progress_suspected": lambda ev, n: (
+        f"⚠ {n.head} no meaningful progress for {_payload(ev, 'progress_age_seconds') or '?'}s", None, None,
+    ),
+    "stale": lambda ev, n: (
+        f"⏱ {n.head} stalled — worker reclaimed for no meaningful progress", None, None,
     ),
     # Re-blocked for the same cause past the limit and routed to `triage` for a
     # human. It emits no blocked/status event, so ping loudly here.
