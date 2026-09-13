@@ -1,5 +1,6 @@
 """Push admission and durable notifier retries use real adapter/SQLite lifecycles."""
 import asyncio
+import json
 
 import pytest
 
@@ -509,3 +510,102 @@ async def test_artifact_native_ack_persistence_failure_holds_without_resend(
         assert not [event for event in kb.list_events(conn, task)
                     if event.kind == "delivery_recorded"]
     assert document_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_migrated_usable_output_queue_notifier_drains_fifo_across_failure_and_restart(
+    tmp_path, monkeypatch,
+):
+    """A held later legacy output cannot rewind or overtake the first queued output."""
+    db_path = tmp_path / "legacy-queue.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    runner, adapter, _source, _key = setup_route()
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="legacy notifier queue", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=task, platform="telegram", chat_id="42",
+            user_id="42", chat_type="dm", delivery_mode="notify",
+        )
+        assert kb.claim_task(conn, task) is not None
+        start_cursor = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs WHERE task_id=? AND platform='telegram' AND chat_id='42'",
+            (task,),
+        ).fetchone()[0]
+
+    # Rebuild only the output table into the pre-coalescing shape and add the
+    # historical event records a notifier receives after an actual old release.
+    legacy = __import__("sqlite3").connect(str(db_path))
+    legacy.execute("DROP TABLE task_usable_output_outbox")
+    legacy.execute("""
+        CREATE TABLE task_usable_output_outbox (
+            task_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, content TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending', platform TEXT, conversation_ref TEXT,
+            session_ref TEXT, native_message_id TEXT, send_attempt_token TEXT,
+            send_attempted_at INTEGER, created_at INTEGER NOT NULL,
+            not_before_at INTEGER NOT NULL DEFAULT 0, delivered_at INTEGER,
+            PRIMARY KEY (task_id, idempotency_key)
+        )
+    """)
+    for key, content, created_at in (("legacy-first", "first durable output", 10), ("legacy-second", "second durable output", 20)):
+        legacy.execute(
+            "INSERT INTO task_usable_output_outbox(task_id, idempotency_key, content, state, created_at, not_before_at) "
+            "VALUES (?, ?, ?, 'pending', ?, 0)",
+            (task, key, content, created_at),
+        )
+        legacy.execute(
+            "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'usable_output', ?, ?)",
+            (task, json.dumps({"idempotency_key": key, "content": content}), created_at),
+        )
+    legacy.commit()
+    legacy.close()
+    kbc.init_db(db_path)
+
+    sent: list[str] = []
+
+    async def first_attempt_fails(chat_id, content, reply_to=None, metadata=None):
+        sent.append(content)
+        if len(sent) == 1:
+            return SendResult(success=False, error="confirmed pre-send failure")
+        return SendResult(success=True, message_id=f"native-{len(sent)}")
+
+    adapter.send = first_attempt_fails
+
+    async def collect_and_deliver(expected_key: str):
+        rows = await asyncio.to_thread(
+            _notifier_collect, runner, kb, notifier_profile=None,
+            gc_due=False, gc_retention_days=30,
+        )
+        for row in rows:
+            assert [event.payload["idempotency_key"] for event in row["events"] if event.kind == "usable_output"] == [
+                expected_key
+            ]
+            await _KanbanNotification(
+                runner, row, platform_cls=Platform, sub_fail_counts={},
+            ).deliver()
+        return rows
+
+    # First provider attempt fails before a native ID: the cursor and first
+    # durable row rewind, while the second remains untouched and cannot overtake.
+    first = await collect_and_deliver("legacy-first")
+    assert len(first) == 1
+    with kbc.connect() as conn:
+        assert kb.get_usable_output_outbox(conn, task, "legacy-first")["state"] == "pending"
+        assert kb.get_usable_output_outbox(conn, task, "legacy-second")["state"] == "pending"
+        assert conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs WHERE task_id=? AND platform='telegram' AND chat_id='42'",
+            (task,),
+        ).fetchone()[0] == start_cursor
+        assert kb.get_task(conn, task).status == "running"
+
+    # A fresh notifier retries and settles only the first event, then a second
+    # fresh tick can select the second. No batch rewind, loss, or duplicate send.
+    second = await collect_and_deliver("legacy-first")
+    assert len(second) == 1
+    third = await collect_and_deliver("legacy-second")
+    assert len(third) == 1
+    with kbc.connect() as conn:
+        assert kb.get_usable_output_outbox(conn, task, "legacy-first")["state"] == "delivered"
+        assert kb.get_usable_output_outbox(conn, task, "legacy-second")["state"] == "delivered"
+        assert kb.get_task(conn, task).status == "running"
+    assert ["first durable output" in message for message in sent] == [True, True, False]
+    assert sent[-1].endswith("second durable output")

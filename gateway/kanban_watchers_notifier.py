@@ -232,18 +232,25 @@ class _Collector:
         if not events:
             return None
         # A paced usable-output event stays at the head of this subscription's
-        # durable cursor until due. Rewind rather than drop it: current output
-        # remains persisted and later updates coalesce into that same record.
+        # durable cursor until due.  Claiming is intentionally batch-oriented,
+        # but a later held output must not undo an earlier eligible one: shorten
+        # the durable claim to the deliverable prefix and leave the held suffix
+        # unseen for a fresh tick.
+        deliverable: list[Any] = []
         for event in events:
-            if event.kind != "usable_output":
-                continue
-            key = (event.payload or {}).get("idempotency_key")
-            if key and not self.kb.usable_output_ready(conn, sub["task_id"], str(key)):
-                _kbn().rewind_notify_cursor(
-                    conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "", claimed_cursor=cursor, old_cursor=old_cursor,
-                )
-                return None
+            if event.kind == "usable_output":
+                key = (event.payload or {}).get("idempotency_key")
+                if key and not self.kb.usable_output_ready(conn, sub["task_id"], str(key)):
+                    selected_cursor = int(deliverable[-1].id) if deliverable else old_cursor
+                    _kbn().rewind_notify_cursor(
+                        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or "", claimed_cursor=cursor, old_cursor=selected_cursor,
+                    )
+                    if not deliverable:
+                        return None
+                    cursor, events = selected_cursor, deliverable
+                    break
+            deliverable.append(event)
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
