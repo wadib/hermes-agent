@@ -30,7 +30,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "delivery_pending")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "delivery_pending", "usable_output")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -360,6 +360,9 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "delivery_pending": lambda ev, n: (
         f"📦 {n.head} delivering verified artifact — {n.title}", None, None,
     ),
+    "usable_output": lambda ev, n: (
+        f"📤 {n.head} progress output — {_clip(ev, 'content', '{}', 400)}", None, None,
+    ),
     # Re-blocked for the same cause past the limit and routed to `triage` for a
     # human. It emits no blocked/status event, so ping loudly here.
     "block_loop_detected": lambda ev, n: (
@@ -600,6 +603,21 @@ class _KanbanNotification:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
+        if ev.kind == "usable_output":
+            key = _payload(ev, "idempotency_key")
+            native_id = getattr(_send_res, "message_id", None)
+            if not key or not native_id:
+                raise RuntimeError("usable output send did not return an idempotency key and native message id")
+            def persist_output_receipt():
+                from hermes_cli import kanban_db as kb
+                from hermes_cli import kanban_db_connect as kbc
+                with kbc.connect(board=self.board_slug) as conn:
+                    return kb.record_usable_output_delivery(
+                        conn, self.task_id, idempotency_key=str(key), platform=self.platform_str,
+                        conversation_ref=str(sub["chat_id"]), session_ref=getattr(self.task, "session_id", None),
+                        native_message_id=str(native_id))
+            if not await _to_thread_process_service(persist_output_receipt):
+                raise RuntimeError("usable output native receipt could not be persisted")
         # Upload artifact paths from the completion payload / legacy result as
         # native files. Only on ``completed`` so retries never spam attachments.
         if ev.kind == "completed":

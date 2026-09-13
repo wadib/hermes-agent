@@ -270,6 +270,18 @@ KANBAN_HEARTBEAT_SCHEMA = _schema(
     [],
 )
 
+KANBAN_USABLE_OUTPUT_SCHEMA = _schema(
+    "kanban_usable_output",
+    "Publish a concrete useful result to the originating conversation while keeping the current task running. Heartbeats and comments do not count. Reuse idempotency_key when retrying the same output.",
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "idempotency_key": _prop("string", "Stable key for this output; retries must use the same key."),
+        "content": _prop("string", "The user-usable result or evidence to deliver now."),
+    },
+    ["idempotency_key", "content"],
+)
+
+
 KANBAN_COMMENT_SCHEMA = _schema(
     "kanban_comment",
     (
