@@ -2118,8 +2118,19 @@ def acquire_mutation_lease(
     conn: sqlite3.Connection, task_id: str, *, workspace_key: str, session_root: str,
     holder: str, ttl_seconds: int = 60,
 ) -> Optional[MutationLease]:
-    """Atomically acquire task, resolved-workspace, and root-session mutation scopes."""
-    scopes = (("task", str(task_id)), ("workspace", str(workspace_key)), ("session", str(session_root)))
+    """Atomically acquire task, resolved-workspace, and root-session mutation scopes.
+
+    The root-session key is paired with the canonical workspace rather than
+    leased globally. One authenticated conversation may legitimately drive two
+    isolated worktrees at once; only a task or shared workspace can serialize
+    those writers.
+    """
+    workspace_key, session_root = str(workspace_key), str(session_root)
+    scopes = (
+        ("task", str(task_id)),
+        ("workspace", workspace_key),
+        ("workspace_session", f"{workspace_key}\0{session_root}"),
+    )
     if not all(key.strip() for _kind, key in scopes) or not str(holder).strip():
         raise ValueError("task, workspace, session root, and holder are required")
     now, expiry = int(time.time()), int(time.time()) + max(1, int(ttl_seconds))
@@ -4600,6 +4611,53 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
         (task_id,),
     ).fetchall()
     return [(r["id"], r["result"]) for r in rows]
+
+
+# Canonical mutation authority is enforced here, at the public domain boundary,
+# so CLI, worker tools, gateway, dashboard and Desktop callers inherit it rather
+# than each maintaining a route-local policy.  Internal dispatch bookkeeping
+# keeps its existing claim CAS and does not impersonate a worker authority.
+from hermes_cli.kanban_db_mutation import (  # noqa: E402
+    MutationLeaseBusyError,
+    MutationLeaseLostError,
+    TaskMutationAuthority,
+    acquire_task_mutation_authority,
+    acquire_worker_mutation_authority,
+    assert_task_mutation_allowed,
+    current_mutation_authority,
+    guard_link_mutator,
+    guard_task_mutator,
+    mutation_authority,
+)
+
+
+def _guard_creator_task_mutation(fn):
+    """Child/direct-session creation is a mutation of its creator's domain."""
+    import functools
+
+    @functools.wraps(fn)
+    def guarded(conn, *args, **kwargs):
+        creator = kwargs.get("creator_task_id")
+        if creator:
+            assert_task_mutation_allowed(conn, creator)
+        return fn(conn, *args, **kwargs)
+
+    return guarded
+
+
+create_task = _guard_creator_task_mutation(create_task)
+for _mutation_name in (
+    "assign_task", "set_model_override", "set_reasoning_effort", "add_comment",
+    "store_attachment_bytes", "add_attachment", "record_delivery_receipt",
+    "publish_usable_output", "record_usable_output_delivery", "record_outbox_delivery",
+    "edit_completed_task_result", "complete_task", "block_task", "request_review",
+    "request_changes", "promote_task", "unblock_task", "reopen_review_task",
+    "specify_triage_task", "archive_task", "delete_archived_task", "delete_task",
+    "schedule_task", "reclaim_task", "reassign_task",
+):
+    globals()[_mutation_name] = guard_task_mutator(globals()[_mutation_name])
+for _mutation_name in ("link_tasks", "unlink_tasks"):
+    globals()[_mutation_name] = guard_link_mutator(globals()[_mutation_name])
 
 
 _PLUGIN_COMPAT_LAZY = {

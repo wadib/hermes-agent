@@ -488,7 +488,34 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
 
 
-# --- Handlers ---
+@contextmanager
+def _worker_mutation_board(board: Optional[str], task_id: str):
+    """Open a board under dispatcher-verified, fenced worker authority.
+
+    Explicit orchestrator calls retain the legacy manual route and are still
+    rejected by the DB boundary when a live worker authority owns the target.
+    """
+    is_worker = (
+        os.environ.get("HERMES_KANBAN_TASK") == task_id
+        and _is_dispatcher_owned_worker()
+    )
+    with _board(board) as (kb, conn):
+        if not is_worker:
+            yield kb, conn
+            return
+        authority = kb.acquire_worker_mutation_authority(
+            conn, task_id,
+            claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK", ""),
+            expected_run_id=_worker_run_id(task_id),
+        )
+        _check(
+            authority is not None,
+            f"mutation lease refused for {task_id}: the dispatcher claim/run is stale or another live writer owns its domain",
+        )
+        with kb.mutation_authority(authority):
+            yield kb, conn
+
+
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
@@ -556,7 +583,7 @@ def _handle_complete(args: dict, **kw) -> str:
     _check(summary or result, "provide at least one of: summary (preferred), result")
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
-    with _board(args.get("board")) as (kb, conn):
+    with _worker_mutation_board(args.get("board"), tid) as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
@@ -601,7 +628,7 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
-    with _board(args.get("board")) as (kb, conn):
+    with _worker_mutation_board(args.get("board"), tid) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
         # The goal loop treats ANY blocked status as terminal, so kanban_block
@@ -648,7 +675,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         _check(profile_exists(reviewer),
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
-    with _board(args.get("board")) as (kb, conn):
+    with _worker_mutation_board(args.get("board"), tid) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         ok, fail_reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
@@ -664,7 +691,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_request_changes", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
-    with _board(args.get("board")) as (kb, conn):
+    with _worker_mutation_board(args.get("board"), tid) as (kb, conn):
         ok, detail = kb.request_changes(
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
@@ -677,7 +704,7 @@ def _handle_usable_output(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_usable_output", args)
     key = _require_text(args, "idempotency_key")
     content = _redact(_require_text(args, "content"))
-    with _board(args.get("board")) as (kb, conn):
+    with _worker_mutation_board(args.get("board"), tid) as (kb, conn):
         _check(kb.publish_usable_output(conn, tid, idempotency_key=key, content=content),
                "usable output requires the current task to remain running")
         return _ok(task_id=tid, idempotency_key=key, status=kb.get_task(conn, tid).status)
@@ -690,7 +717,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     be reclaimed by ``release_stale_claims``."""
     tid = _worker_guard("kanban_heartbeat", args)
     from hermes_cli import kanban_db_dispatch as kbd
-    with _board(args.get("board")) as (kb, conn):
+    with _worker_mutation_board(args.get("board"), tid) as (kb, conn):
         # The dispatcher pins HERMES_KANBAN_CLAIM_LOCK at spawn; the default
         # claimer covers locally-driven workers that bypassed the dispatcher.
         kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
@@ -717,7 +744,12 @@ def _handle_comment(args: dict, **kw) -> str:
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
     author = os.environ.get("HERMES_PROFILE") or "worker"
-    with _board(args.get("board")) as (kb, conn):
+    board_scope = (
+        _worker_mutation_board(args.get("board"), tid)
+        if os.environ.get("HERMES_KANBAN_TASK") == tid and _is_dispatcher_owned_worker()
+        else _board(args.get("board"))
+    )
+    with board_scope as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
 
@@ -725,7 +757,7 @@ def _handle_comment(args: dict, **kw) -> str:
 def _store_attachment(board, tid, filename, data, content_type) -> str:
     """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
     dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
-    with _board(board) as (kb, conn):
+    with _worker_mutation_board(board, tid) as (kb, conn):
         att_id = kb.store_attachment_bytes(
             conn, tid, str(filename), data,
             content_type=content_type, uploaded_by="agent", board=board)
@@ -844,10 +876,10 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
-    with _board(args.get("board")) as (kb, conn):
+    self_tid = (os.environ.get("HERMES_KANBAN_TASK")
+                if _is_dispatcher_owned_worker() else None)
+    with _worker_mutation_board(args.get("board"), self_tid or "") as (kb, conn):
         from tools.async_delegation import _current_origin_session_id
-        self_tid = (os.environ.get("HERMES_KANBAN_TASK")
-                    if _is_dispatcher_owned_worker() else None)
         self_task = kb.get_task(conn, self_tid) if self_tid else None
         # The worker/API runtime may be transient; the owning task's origin is durable.
         session_id = (args.get("session_id") or (self_task.session_id if self_task else None)

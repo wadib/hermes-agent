@@ -717,6 +717,7 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
+        kanban_db.assert_task_mutation_allowed(conn, task_id)
         _require_task(conn, task_id)
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
@@ -852,6 +853,7 @@ def delete_link(parent_id: str = Query(...), child_id: str = Query(...), board: 
 def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str], entry: dict) -> None:
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
+    kanban_db.assert_task_mutation_allowed(conn, tid)
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:

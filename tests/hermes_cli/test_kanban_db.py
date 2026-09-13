@@ -402,6 +402,80 @@ def test_cross_domain_mutation_lease_fences_competing_owner(kanban_home):
         assert not kb.mutation_lease_valid(conn, task, holder="owner-a", fence=1)
         assert kb.mutation_lease_valid(conn, task, holder="owner-b", fence=2)
 
+
+def test_canonical_mutation_authority_fences_shared_domains_and_stale_writers(kanban_home, tmp_path):
+    """The domain guard blocks every non-owner write before its mutator runs.
+
+    The two task rows share a canonical workspace/session; a task in another
+    worktree with the same root session remains independently mutable.
+    """
+    shared = tmp_path / "repo" / ".worktrees" / "shared"
+    isolated = tmp_path / "repo" / ".worktrees" / "isolated"
+    with kbc.connect() as conn:
+        first_task = kb.create_task(
+            conn, title="first", workspace_kind="dir", workspace_path=str(shared), session_id="root")
+        same_domain = kb.create_task(
+            conn, title="second", workspace_kind="dir", workspace_path=str(shared), session_id="root")
+        isolated_task = kb.create_task(
+            conn, title="isolated", workspace_kind="dir", workspace_path=str(isolated), session_id="root")
+        first = kb.acquire_task_mutation_authority(conn, first_task, holder="owner-a")
+        assert first is not None
+
+        # Read-only remains available while a writer owns the mutation domain.
+        assert kb.get_task(conn, same_domain) is not None
+        assert kb.list_comments(conn, same_domain) == []
+        with pytest.raises(kb.MutationLeaseBusyError):
+            kb.add_comment(conn, same_domain, "operator", "must wait")
+        with kb.mutation_authority(first):
+            kb.add_comment(conn, first_task, "owner-a", "owned write")
+        # Different canonical worktree, same root session: no false serialization.
+        other = kb.acquire_task_mutation_authority(conn, isolated_task, holder="owner-b")
+        assert other is not None
+
+        conn.execute("UPDATE task_mutation_leases SET expires_at=0 WHERE holder='owner-a'")
+        successor = kb.acquire_task_mutation_authority(conn, first_task, holder="owner-c")
+        assert successor is not None and successor.fence > first.fence
+        with kb.mutation_authority(first), pytest.raises(kb.MutationLeaseLostError):
+            kb.add_comment(conn, first_task, "owner-a", "stale write")
+        with kb.mutation_authority(successor):
+            kb.add_comment(conn, first_task, "owner-c", "fenced successor")
+        assert [comment.body for comment in kb.list_comments(conn, first_task)] == ["owned write", "fenced successor"]
+
+
+@pytest.mark.parametrize("entry", [
+    lambda conn, tid: kb.add_comment(conn, tid, "operator", "x"),
+    lambda conn, tid: kb.assign_task(conn, tid, "other"),
+    lambda conn, tid: kb.set_model_override(conn, tid, "model"),
+    lambda conn, tid: kb.block_task(conn, tid, reason="x"),
+    lambda conn, tid: kb.complete_task(conn, tid, summary="x"),
+    lambda conn, tid: kb.request_review(conn, tid, summary="x"),
+    lambda conn, tid: kb.archive_task(conn, tid),
+    lambda conn, tid: kb.create_task(conn, title="child", creator_task_id=tid),
+])
+def test_public_mutation_entries_share_the_live_lease_guard(kanban_home, entry):
+    """Route-inventory contract: each representative public mutation is fenced behaviorally."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="guarded")
+        assert kb.acquire_task_mutation_authority(conn, tid, holder="worker-a") is not None
+        with pytest.raises(kb.MutationLeaseBusyError):
+            entry(conn, tid)
+
+
+def test_worker_authority_requires_current_dispatcher_run_and_claim(kanban_home):
+    """A caller-provided worker identity is not authority without the durable claim."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="claimed")
+        task = kb.claim_task(conn, tid)
+        assert task is not None and task.current_run_id is not None and task.claim_lock
+        assert kb.acquire_worker_mutation_authority(
+            conn, tid, claim_lock="forged", expected_run_id=task.current_run_id) is None
+        authority = kb.acquire_worker_mutation_authority(
+            conn, tid, claim_lock=task.claim_lock, expected_run_id=task.current_run_id)
+        assert authority is not None
+        with kb.mutation_authority(authority):
+            assert kb.block_task(conn, tid, reason="verified owner")
+
+
 def test_bare_heartbeat_never_resets_meaningful_progress_age(kanban_home, monkeypatch):
     """Liveness keeps the lease alive but cannot suppress the 60s progress watchdog."""
     with kbc.connect() as conn:
