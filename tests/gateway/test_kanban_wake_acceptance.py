@@ -256,3 +256,185 @@ async def test_usable_output_notifier_reconciles_ack_after_receipt_crash_without
             conn, task, "usable-crash", send_attempt_token=token)
         assert kb.get_task(conn, task).status == "running"
     assert adapter.provider_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_artifact_notifier_reconciles_native_ack_after_fresh_restart_without_resend(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    runner, adapter, _source, key = setup_route()
+    artifact = tmp_path / "restart-proof.txt"
+    artifact.write_text("durable artifact", encoding="utf-8")
+    document_calls = []
+
+    async def accepted_document(chat_id, file_path, metadata=None, **_kwargs):
+        document_calls.append((chat_id, file_path, metadata))
+        return SendResult(success=True, message_id="native-artifact-restart")
+
+    adapter.send_document = accepted_document
+    with kbc.connect() as conn:
+        task = kb.create_task(
+            conn, title="restart delivery", assignee="worker",
+            session_id=key, delivery_required=True,
+        )
+        kb.add_attachment(
+            conn, task, filename=artifact.name, stored_path=str(artifact),
+            size=artifact.stat().st_size,
+        )
+        kbn.add_notify_sub(
+            conn, task_id=task, platform="telegram", chat_id="42",
+            thread_id="thread-1", user_id="42", chat_type="dm",
+            delivery_mode="notify",
+        )
+        assert kb.complete_task(conn, task, summary="ready for delivery")
+
+    first_rows = await asyncio.to_thread(
+        _notifier_collect, runner, kb, notifier_profile=None,
+        gc_due=False, gc_retention_days=30,
+    )
+    assert len(first_rows) == 1
+    first_notifier = _KanbanNotification(
+        runner, first_rows[0], platform_cls=Platform, sub_fail_counts={},
+    )
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            kb, "record_outbox_delivery",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("final receipt DB crash")
+            ),
+        )
+        await first_notifier.deliver()
+
+    with kbc.connect() as conn:
+        held = kb.get_delivery_outbox(conn, task)
+        assert held is not None
+        attempt_token = held.send_attempt_token
+        assert held.state == "sending"
+        assert held.native_message_id == "native-artifact-restart"
+        assert attempt_token
+        assert kb.get_task(conn, task).status == "delivery_pending"
+        assert not [event for event in kb.list_events(conn, task)
+                    if event.kind == "delivery_recorded"]
+    assert len(document_calls) == 1
+
+    del first_notifier, first_rows
+    restarted_rows = await asyncio.to_thread(
+        _notifier_collect, runner, kb, notifier_profile=None,
+        gc_due=False, gc_retention_days=30,
+    )
+    assert len(restarted_rows) == 1
+    restarted_notifier = _KanbanNotification(
+        runner, restarted_rows[0], platform_cls=Platform, sub_fail_counts={},
+    )
+    await restarted_notifier.deliver()
+
+    with kbc.connect() as conn:
+        delivered = kb.get_delivery_outbox(conn, task)
+        assert delivered is not None
+        assert (
+            delivered.state,
+            delivered.platform,
+            delivered.conversation_ref,
+            delivered.thread_id,
+            delivered.subscription_identity,
+            delivered.session_ref,
+            delivered.native_message_id,
+            delivered.send_attempt_token,
+        ) == (
+            "delivered",
+            "telegram",
+            "42",
+            "thread-1",
+            "user:42",
+            key,
+            "native-artifact-restart",
+            attempt_token,
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_delivery_outbox WHERE task_id=? AND state='delivered'",
+            (task,),
+        ).fetchone()[0] == 1
+        assert len([event for event in kb.list_events(conn, task)
+                    if event.kind == "delivery_recorded"]) == 1
+        assert kb.get_task(conn, task).status == "awaiting_acceptance"
+    assert len(document_calls) == 1
+
+    del restarted_notifier, restarted_rows
+    repeated_rows = await asyncio.to_thread(
+        _notifier_collect, runner, kb, notifier_profile=None,
+        gc_due=False, gc_retention_days=30,
+    )
+    for row in repeated_rows:
+        await _KanbanNotification(
+            runner, row, platform_cls=Platform, sub_fail_counts={},
+        ).deliver()
+    assert repeated_rows == []
+    assert len(document_calls) == 1
+    with kbc.connect() as conn:
+        assert len([event for event in kb.list_events(conn, task)
+                    if event.kind == "delivery_recorded"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_artifact_notifier_holds_sending_row_without_native_evidence(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    runner, adapter, _source, _key = setup_route()
+    artifact = tmp_path / "ambiguous-proof.txt"
+    artifact.write_text("ambiguous artifact", encoding="utf-8")
+    document_calls = 0
+
+    async def unexpected_document(*_args, **_kwargs):
+        nonlocal document_calls
+        document_calls += 1
+        return SendResult(success=True, message_id="must-not-send")
+
+    adapter.send_document = unexpected_document
+    with kbc.connect() as conn:
+        task = kb.create_task(
+            conn, title="held delivery", assignee="worker",
+            delivery_required=True,
+        )
+        kb.add_attachment(
+            conn, task, filename=artifact.name, stored_path=str(artifact),
+            size=artifact.stat().st_size,
+        )
+        kbn.add_notify_sub(
+            conn, task_id=task, platform="telegram", chat_id="42",
+            thread_id="held-thread", user_id="42", chat_type="dm",
+            delivery_mode="notify",
+        )
+        assert kb.complete_task(conn, task, summary="ready but ambiguous")
+        attempt_token = kb.begin_outbox_send_attempt(conn, task)
+        assert attempt_token
+
+    rows = await asyncio.to_thread(
+        _notifier_collect, runner, kb, notifier_profile=None,
+        gc_due=False, gc_retention_days=30,
+    )
+    assert len(rows) == 1
+    await _KanbanNotification(
+        runner, rows[0], platform_cls=Platform, sub_fail_counts={},
+    ).deliver()
+
+    with kbc.connect() as conn:
+        held = kb.get_delivery_outbox(conn, task)
+        assert held is not None
+        assert (
+            held.state,
+            held.native_message_id,
+            held.send_attempt_token,
+            held.platform,
+            held.conversation_ref,
+            held.thread_id,
+        ) == ("sending", None, attempt_token, None, None, None)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_delivery_outbox WHERE task_id=? AND state='delivered'",
+            (task,),
+        ).fetchone()[0] == 0
+        assert not [event for event in kb.list_events(conn, task)
+                    if event.kind == "delivery_recorded"]
+        assert kb.get_task(conn, task).status == "delivery_pending"
+    assert document_calls == 0

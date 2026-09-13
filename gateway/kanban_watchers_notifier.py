@@ -473,6 +473,30 @@ class _KanbanNotification:
         if task.status != "delivery_pending":
             return
         if outbox.state == "sending":
+            # A persisted native id is evidence of a provider-accepted upload.
+            # Reconcile it through the original fenced attempt; never re-upload.
+            if outbox.native_message_id and outbox.send_attempt_token:
+                def reconcile_native_ack():
+                    from hermes_cli import kanban_db as kb
+                    from hermes_cli import kanban_db_connect as kbc
+                    with kbc.connect(board=self.board_slug) as conn:
+                        identity = kb._subscription_identity(
+                            self.sub.get("user_id"), self.sub.get("user_id_alt"),
+                            platform=self.platform_str, chat_id=str(self.sub["chat_id"]),
+                            thread_id=str(self.sub.get("thread_id") or ""),
+                        )
+                        return kb.record_outbox_delivery(
+                            conn, self.task_id, platform=self.platform_str,
+                            conversation_ref=str(self.sub["chat_id"]),
+                            thread_id=self.sub.get("thread_id") or None,
+                            subscription_identity=identity,
+                            session_ref=getattr(task, "session_id", None),
+                            native_message_id=str(outbox.native_message_id),
+                            send_attempt_token=str(outbox.send_attempt_token),
+                        )
+                if await _to_thread_process_service(reconcile_native_ack):
+                    return
+                raise RuntimeError("artifact native acknowledgement could not be reconciled")
             raise RuntimeError("artifact send is awaiting native receipt reconciliation; refusing a duplicate upload")
 
         def begin_attempt():
