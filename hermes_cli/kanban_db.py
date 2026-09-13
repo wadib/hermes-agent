@@ -1130,6 +1130,15 @@ CREATE TABLE IF NOT EXISTS task_usable_output_outbox (
     PRIMARY KEY (task_id, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS task_mutation_leases (
+    scope_kind TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    holder TEXT NOT NULL,
+    fence INTEGER NOT NULL DEFAULT 1,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (scope_kind, scope_key)
+);
+
 -- Explicit acceptance is separate from delivery and is the sole authorization
 -- for the final Done transition of delivery-required work.
 CREATE TABLE IF NOT EXISTS task_acceptances (
@@ -2096,6 +2105,50 @@ def record_usable_output_delivery(
             "UPDATE task_usable_output_outbox SET state='delivered', platform=?, conversation_ref=?, session_ref=?, native_message_id=?, delivered_at=? WHERE task_id=? AND idempotency_key=? AND state='pending'",
             (platform, conversation_ref, session_ref or None, native_message_id, int(time.time()), task_id, idempotency_key),
         ).rowcount == 1
+
+
+@dataclass(frozen=True)
+class MutationLease:
+    holder: str
+    fence: int
+    expires_at: int
+
+
+def acquire_mutation_lease(
+    conn: sqlite3.Connection, task_id: str, *, workspace_key: str, session_root: str,
+    holder: str, ttl_seconds: int = 60,
+) -> Optional[MutationLease]:
+    """Atomically acquire task, resolved-workspace, and root-session mutation scopes."""
+    scopes = (("task", str(task_id)), ("workspace", str(workspace_key)), ("session", str(session_root)))
+    if not all(key.strip() for _kind, key in scopes) or not str(holder).strip():
+        raise ValueError("task, workspace, session root, and holder are required")
+    now, expiry = int(time.time()), int(time.time()) + max(1, int(ttl_seconds))
+    with write_txn(conn):
+        rows = { (row["scope_kind"], row["scope_key"]): row for row in conn.execute(
+            "SELECT scope_kind, scope_key, holder, fence, expires_at FROM task_mutation_leases "
+            "WHERE (scope_kind, scope_key) IN ((?, ?), (?, ?), (?, ?))",
+            tuple(value for scope in scopes for value in scope),
+        ).fetchall() }
+        live_foreign = [row for scope, row in rows.items() if row["expires_at"] >= now and row["holder"] != holder]
+        if live_foreign:
+            return None
+        fence = max((int(row["fence"]) + (1 if row["expires_at"] < now and row["holder"] != holder else 0)
+                     for row in rows.values()), default=1)
+        for kind, key in scopes:
+            row = rows.get((kind, key))
+            next_fence = fence if row is None or row["holder"] != holder else int(row["fence"])
+            conn.execute(
+                "INSERT INTO task_mutation_leases(scope_kind, scope_key, holder, fence, expires_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scope_kind, scope_key) DO UPDATE SET holder=excluded.holder, fence=excluded.fence, expires_at=excluded.expires_at",
+                (kind, key, holder, next_fence, expiry),
+            )
+        return MutationLease(str(holder), fence, expiry)
+
+
+def mutation_lease_valid(conn: sqlite3.Connection, task_id: str, *, holder: str, fence: int) -> bool:
+    now = int(time.time())
+    row = conn.execute("SELECT holder, fence, expires_at FROM task_mutation_leases WHERE scope_kind='task' AND scope_key=?", (task_id,)).fetchone()
+    return bool(row and row["holder"] == holder and int(row["fence"]) == int(fence) and int(row["expires_at"]) >= now)
 
 
 def get_task_acceptance(conn: sqlite3.Connection, task_id: str) -> Optional[TaskAcceptance]:

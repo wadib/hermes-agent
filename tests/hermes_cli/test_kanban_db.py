@@ -385,6 +385,23 @@ def test_delivery_outbox_requires_persisted_delivery_and_explicit_acceptance(kan
 
 
 
+def test_cross_domain_mutation_lease_fences_competing_owner(kanban_home):
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="lease", assignee="worker")
+        first = kb.acquire_mutation_lease(
+            conn, task, workspace_key="C:/repo/.worktrees/a", session_root="root-1", holder="owner-a", ttl_seconds=60)
+        assert first and first.fence == 1
+        assert kb.acquire_mutation_lease(
+            conn, task, workspace_key="C:/repo/.worktrees/a", session_root="root-1", holder="owner-a", ttl_seconds=60).fence == 1
+        assert kb.acquire_mutation_lease(
+            conn, task, workspace_key="C:/repo/.worktrees/a", session_root="root-2", holder="owner-b", ttl_seconds=60) is None
+        conn.execute("UPDATE task_mutation_leases SET expires_at=0")
+        successor = kb.acquire_mutation_lease(
+            conn, task, workspace_key="C:/repo/.worktrees/a", session_root="root-2", holder="owner-b", ttl_seconds=60)
+        assert successor and successor.fence == 2
+        assert not kb.mutation_lease_valid(conn, task, holder="owner-a", fence=1)
+        assert kb.mutation_lease_valid(conn, task, holder="owner-b", fence=2)
+
 def test_bare_heartbeat_never_resets_meaningful_progress_age(kanban_home, monkeypatch):
     """Liveness keeps the lease alive but cannot suppress the 60s progress watchdog."""
     with kbc.connect() as conn:
