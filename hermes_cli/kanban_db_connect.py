@@ -842,6 +842,9 @@ _DELIVERY_OUTBOX_COLUMNS = (
 
 _USABLE_OUTPUT_OUTBOX_COLUMNS = (
     ("not_before_at", "not_before_at INTEGER NOT NULL DEFAULT 0"),
+    ("thread_id", "thread_id TEXT"),
+    ("send_attempt_token", "send_attempt_token TEXT"),
+    ("send_attempted_at", "send_attempted_at INTEGER"),
 )
 
 

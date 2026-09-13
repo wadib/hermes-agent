@@ -495,7 +495,7 @@ def test_bare_heartbeat_never_resets_meaningful_progress_age(kanban_home, monkey
         event_kinds = [event.kind for event in kb.list_events(conn, task)]
         assert "stale" in event_kinds
 
-def test_usable_output_is_idempotent_and_receipt_keeps_task_running(kanban_home):
+def test_usable_output_send_attempt_retries_then_reconciles_once_while_running(kanban_home):
     with kbc.connect() as conn:
         task = kb.create_task(conn, title="progress", assignee="worker")
         assert kb.claim_task(conn, task) is not None
@@ -503,15 +503,41 @@ def test_usable_output_is_idempotent_and_receipt_keeps_task_running(kanban_home)
         assert kb.publish_usable_output(conn, task, idempotency_key="step-1", content="duplicate retry")
         row = kb.get_usable_output_outbox(conn, task, "step-1")
         assert row["state"] == "pending" and row["content"] == "first usable result"
-        assert kb.record_usable_output_delivery(
-            conn, task, idempotency_key="step-1", platform="telegram", conversation_ref="chat-1",
-            session_ref="s-1", native_message_id="m-1",
-        )
-        assert kb.get_task(conn, task).status == "running"
-        assert kb.record_usable_output_delivery(
-            conn, task, idempotency_key="step-1", platform="telegram", conversation_ref="chat-1",
-            session_ref="s-1", native_message_id="m-1",
-        )
+
+        first = kb.begin_usable_output_send_attempt(conn, task, "step-1")
+        assert first
+        assert not kb.reset_usable_output_send_attempt(
+            conn, task, "step-1", send_attempt_token="wrong")
+        assert kb.reset_usable_output_send_attempt(
+            conn, task, "step-1", send_attempt_token=first)
+        second = kb.begin_usable_output_send_attempt(conn, task, "step-1")
+        assert second and second != first
+        assert kb.reset_usable_output_send_attempt(
+            conn, task, "step-1", send_attempt_token=second)
+        third = kb.begin_usable_output_send_attempt(conn, task, "step-1")
+        assert third and third not in {first, second}
+        assert not kb.mark_usable_output_native_ack(
+            conn, task, "step-1", send_attempt_token="wrong", platform="telegram",
+            conversation_ref="chat-1", thread_id="thread-1", session_ref="s-1",
+            native_message_id="m-1")
+        assert kb.mark_usable_output_native_ack(
+            conn, task, "step-1", send_attempt_token=third, platform="telegram",
+            conversation_ref="chat-1", thread_id="thread-1", session_ref="s-1",
+            native_message_id="m-1")
+        held = kb.get_usable_output_outbox(conn, task, "step-1")
+        assert (held["state"], held["platform"], held["conversation_ref"], held["thread_id"],
+                held["native_message_id"]) == (
+                    "sending", "telegram", "chat-1", "thread-1", "m-1")
+        assert not kb.reset_usable_output_send_attempt(
+            conn, task, "step-1", send_attempt_token=third)
+        assert not kb.reconcile_usable_output_delivery(
+            conn, task, "step-1", send_attempt_token="wrong")
+        assert kb.reconcile_usable_output_delivery(
+            conn, task, "step-1", send_attempt_token=third)
+        assert kb.reconcile_usable_output_delivery(
+            conn, task, "step-1", send_attempt_token=third)
+        delivered = kb.get_usable_output_outbox(conn, task, "step-1")
+        assert delivered["state"] == "delivered" and delivered["delivered_at"]
         assert kb.get_task(conn, task).status == "running"
 
 
@@ -545,6 +571,26 @@ def test_delivery_send_attempt_holds_ambiguous_restart_without_false_receipt(kan
         assert kb.begin_outbox_send_attempt(conn, task) is None
 
 
+def test_artifact_native_ack_fences_reset_and_reconciles_once(kanban_home, tmp_path):
+    artifact = tmp_path / "ack.txt"
+    artifact.write_text("proof", encoding="utf-8")
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="ack", delivery_required=True)
+        kb.add_attachment(conn, task, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
+        assert kb.complete_task(conn, task, summary="ready")
+        first = kb.begin_outbox_send_attempt(conn, task)
+        assert first and kb.reset_outbox_send_attempt(conn, task, send_attempt_token=first)
+        second = kb.begin_outbox_send_attempt(conn, task)
+        assert second and second != first
+        assert not kb.mark_outbox_native_ack(conn, task, send_attempt_token="wrong", native_message_id="native-1")
+        assert kb.mark_outbox_native_ack(conn, task, send_attempt_token=second, native_message_id="native-1")
+        held = kb.get_delivery_outbox(conn, task)
+        assert held and held.state == "sending" and held.native_message_id == "native-1"
+        assert not kb.reset_outbox_send_attempt(conn, task, send_attempt_token=second)
+        assert not kb.record_outbox_delivery(conn, task, platform="telegram", conversation_ref="chat", thread_id=None, subscription_identity="user:u", session_ref=None, native_message_id="native-1", send_attempt_token="wrong")
+        assert kb.record_outbox_delivery(conn, task, platform="telegram", conversation_ref="chat", thread_id=None, subscription_identity="user:u", session_ref=None, native_message_id="native-1", send_attempt_token=second)
+        assert kb.record_outbox_delivery(conn, task, platform="telegram", conversation_ref="chat", thread_id=None, subscription_identity="user:u", session_ref=None, native_message_id="native-1", send_attempt_token=second)
+        assert kb.get_task(conn, task).status == "awaiting_acceptance"
 def test_desktop_acceptance_binds_exact_tui_session_and_user_row(kanban_home, tmp_path):
     """Desktop completion cannot be attested by a mismatched session or generic caller."""
     artifact = tmp_path / "desktop-evidence.txt"

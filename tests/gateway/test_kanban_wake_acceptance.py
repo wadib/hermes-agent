@@ -6,6 +6,7 @@ import pytest
 from evals.heartbeat_idle_wire import WireAdapter
 from gateway.config import Platform, PlatformConfig
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
+from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
@@ -148,3 +149,110 @@ async def test_notifier_retries_unaccepted_wake_without_repeating_pings(tmp_path
     assert len(adapter.wire) == 2
     assert not any(unseen(mode) for mode in tids)
     await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_usable_output_notifier_retries_two_confirmed_failures_then_delivers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    runner, adapter, _source, _key = setup_route()
+    adapter.provider_calls = 0
+
+    async def flaky_send(chat_id, content, reply_to=None, metadata=None):
+        adapter.provider_calls += 1
+        if adapter.provider_calls < 3:
+            return SendResult(success=False, error="confirmed pre-send failure")
+        adapter.wire.append(content)
+        return SendResult(success=True, message_id="native-output-1")
+
+    adapter.send = flaky_send
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="progress", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=task, platform="telegram", chat_id="42",
+                           user_id="42", chat_type="dm", delivery_mode="notify")
+        assert kb.claim_task(conn, task) is not None
+        assert kb.publish_usable_output(
+            conn, task, idempotency_key="usable-1", content="usable result")
+
+    failures = {}
+
+    async def tick():
+        rows = await asyncio.to_thread(
+            _notifier_collect, runner, kb, notifier_profile=None,
+            gc_due=False, gc_retention_days=30)
+        for row in rows:
+            await _KanbanNotification(
+                runner, row, platform_cls=Platform, sub_fail_counts=failures).deliver()
+
+    await tick()
+    await tick()
+    await tick()
+    with kbc.connect() as conn:
+        outbox = kb.get_usable_output_outbox(conn, task, "usable-1")
+        sub = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id=? AND platform='telegram' AND chat_id='42'",
+            (task,),
+        ).fetchone()
+        assert outbox["state"] == "delivered"
+        assert outbox["native_message_id"] == "native-output-1"
+        assert kb.get_task(conn, task).status == "running"
+        assert sub is not None
+    assert adapter.provider_calls == 3
+    assert len(adapter.wire) == 1 and "usable result" in adapter.wire[0]
+
+
+@pytest.mark.asyncio
+async def test_usable_output_notifier_reconciles_ack_after_receipt_crash_without_resend(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    runner, adapter, _source, _key = setup_route()
+    adapter.provider_calls = 0
+
+    async def accepted_send(chat_id, content, reply_to=None, metadata=None):
+        adapter.provider_calls += 1
+        adapter.wire.append(content)
+        return SendResult(success=True, message_id="native-output-crash")
+
+    adapter.send = accepted_send
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="progress", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=task, platform="telegram", chat_id="42",
+                           thread_id="thread-1", user_id="42", chat_type="dm",
+                           delivery_mode="notify")
+        assert kb.claim_task(conn, task) is not None
+        assert kb.publish_usable_output(
+            conn, task, idempotency_key="usable-crash", content="durable result")
+
+    failures = {}
+
+    async def tick():
+        rows = await asyncio.to_thread(
+            _notifier_collect, runner, kb, notifier_profile=None,
+            gc_due=False, gc_retention_days=30)
+        for row in rows:
+            await _KanbanNotification(
+                runner, row, platform_cls=Platform, sub_fail_counts=failures).deliver()
+
+    real_reconcile = kb.reconcile_usable_output_delivery
+    monkeypatch.setattr(
+        kb, "reconcile_usable_output_delivery",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("receipt DB crash")))
+    await tick()
+    with kbc.connect() as conn:
+        held = kb.get_usable_output_outbox(conn, task, "usable-crash")
+        token = held["send_attempt_token"]
+        assert held["state"] == "sending"
+        assert held["native_message_id"] == "native-output-crash"
+        assert held["thread_id"] == "thread-1"
+        assert token
+        assert not kb.reset_usable_output_send_attempt(
+            conn, task, "usable-crash", send_attempt_token=token)
+    assert adapter.provider_calls == 1
+
+    monkeypatch.setattr(kb, "reconcile_usable_output_delivery", real_reconcile)
+    await tick()
+    with kbc.connect() as conn:
+        delivered = kb.get_usable_output_outbox(conn, task, "usable-crash")
+        assert delivered["state"] == "delivered"
+        assert kb.reconcile_usable_output_delivery(
+            conn, task, "usable-crash", send_attempt_token=token)
+        assert kb.get_task(conn, task).status == "running"
+    assert adapter.provider_calls == 1

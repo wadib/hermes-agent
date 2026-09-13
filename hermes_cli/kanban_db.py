@@ -1144,8 +1144,11 @@ CREATE TABLE IF NOT EXISTS task_usable_output_outbox (
     state             TEXT NOT NULL DEFAULT 'pending',
     platform          TEXT,
     conversation_ref  TEXT,
+    thread_id         TEXT,
     session_ref       TEXT,
     native_message_id TEXT,
+    send_attempt_token TEXT,
+    send_attempted_at INTEGER,
     created_at        INTEGER NOT NULL,
     not_before_at     INTEGER NOT NULL DEFAULT 0,
     delivered_at      INTEGER,
@@ -2156,28 +2159,94 @@ def get_usable_output_outbox(conn: sqlite3.Connection, task_id: str, idempotency
 
 
 def usable_output_ready(conn: sqlite3.Connection, task_id: str, idempotency_key: str) -> bool:
+    """True when an output may be sent, reconciled, or cursor-settled without waiting."""
     row = get_usable_output_outbox(conn, task_id, idempotency_key)
-    return bool(row and row["state"] == "pending" and int(row["not_before_at"] or 0) <= int(time.time()))
+    if row is None:
+        return False
+    if row["state"] in {"sending", "delivered"}:
+        return True
+    return row["state"] == "pending" and int(row["not_before_at"] or 0) <= int(time.time())
 
 
-def record_usable_output_delivery(
-    conn: sqlite3.Connection, task_id: str, *, idempotency_key: str, platform: str,
-    conversation_ref: str, session_ref: Optional[str], native_message_id: str,
-) -> bool:
-    """Persist a native usable-output receipt while deliberately leaving task status unchanged."""
-    if not all(str(v or "").strip() for v in (idempotency_key, platform, conversation_ref, native_message_id)):
-        raise ValueError("output key, platform, conversation_ref, and native_message_id are required")
+def begin_usable_output_send_attempt(
+    conn: sqlite3.Connection, task_id: str, idempotency_key: str,
+) -> Optional[str]:
+    """Atomically fence one due pending output before any provider call."""
+    token = secrets.token_hex(16)
+    now = int(time.time())
     with write_txn(conn):
         row = get_usable_output_outbox(conn, task_id, idempotency_key)
         task = get_task(conn, task_id)
-        if row is None or task is None or task.status != "running":
+        if (row is None or task is None or task.status != "running"
+                or row["state"] != "pending" or int(row["not_before_at"] or 0) > now):
+            return None
+        changed = conn.execute(
+            "UPDATE task_usable_output_outbox "
+            "SET state='sending', send_attempt_token=?, send_attempted_at=? "
+            "WHERE task_id=? AND idempotency_key=? AND state='pending' AND not_before_at<=?",
+            (token, now, task_id, idempotency_key, now),
+        ).rowcount
+    return token if changed == 1 else None
+
+
+def reset_usable_output_send_attempt(
+    conn: sqlite3.Connection, task_id: str, idempotency_key: str, *, send_attempt_token: str,
+) -> bool:
+    """Reset only this confirmed pre-send failure; native-acked attempts stay ambiguous."""
+    with write_txn(conn):
+        return conn.execute(
+            "UPDATE task_usable_output_outbox "
+            "SET state='pending', send_attempt_token=NULL, send_attempted_at=NULL "
+            "WHERE task_id=? AND idempotency_key=? AND state='sending' "
+            "AND send_attempt_token=? AND native_message_id IS NULL",
+            (task_id, idempotency_key, send_attempt_token),
+        ).rowcount == 1
+
+
+def mark_usable_output_native_ack(
+    conn: sqlite3.Connection, task_id: str, idempotency_key: str, *,
+    send_attempt_token: str, platform: str, conversation_ref: str,
+    thread_id: Optional[str], session_ref: Optional[str], native_message_id: str,
+) -> bool:
+    """Persist provider-native identity while retaining the token-fenced sending state."""
+    if not all(str(value or "").strip() for value in (
+            send_attempt_token, platform, conversation_ref, native_message_id)):
+        raise ValueError(
+            "send_attempt_token, platform, conversation_ref, and native_message_id are required")
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None or task.status != "running":
+            return False
+        return conn.execute(
+            "UPDATE task_usable_output_outbox "
+            "SET platform=?, conversation_ref=?, thread_id=?, session_ref=?, native_message_id=? "
+            "WHERE task_id=? AND idempotency_key=? AND state='sending' "
+            "AND send_attempt_token=? AND native_message_id IS NULL",
+            (platform, conversation_ref, str(thread_id or "") or None, session_ref or None,
+             native_message_id, task_id, idempotency_key, send_attempt_token),
+        ).rowcount == 1
+
+
+def reconcile_usable_output_delivery(
+    conn: sqlite3.Connection, task_id: str, idempotency_key: str, *, send_attempt_token: str,
+) -> bool:
+    """Settle one native-acked attempt exactly once; matching repeats are idempotent."""
+    with write_txn(conn):
+        row = get_usable_output_outbox(conn, task_id, idempotency_key)
+        if row is None or row["send_attempt_token"] != send_attempt_token:
             return False
         if row["state"] == "delivered":
-            return (row["platform"], row["conversation_ref"], row["native_message_id"]) == (
-                platform, conversation_ref, native_message_id)
+            return True
+        task = get_task(conn, task_id)
+        if (task is None or task.status != "running" or row["state"] != "sending"
+                or not all(str(row[field] or "").strip() for field in (
+                    "platform", "conversation_ref", "native_message_id"))):
+            return False
         return conn.execute(
-            "UPDATE task_usable_output_outbox SET state='delivered', platform=?, conversation_ref=?, session_ref=?, native_message_id=?, delivered_at=? WHERE task_id=? AND idempotency_key=? AND state='pending'",
-            (platform, conversation_ref, session_ref or None, native_message_id, int(time.time()), task_id, idempotency_key),
+            "UPDATE task_usable_output_outbox SET state='delivered', delivered_at=? "
+            "WHERE task_id=? AND idempotency_key=? AND state='sending' "
+            "AND send_attempt_token=? AND native_message_id IS NOT NULL",
+            (int(time.time()), task_id, idempotency_key, send_attempt_token),
         ).rowcount == 1
 
 
@@ -2283,6 +2352,20 @@ def begin_outbox_send_attempt(conn: sqlite3.Connection, task_id: str) -> Optiona
         ).rowcount != 1:
             return None
     return token
+
+
+
+
+def mark_outbox_native_ack(conn: sqlite3.Connection, task_id: str, *, send_attempt_token: str, native_message_id: str) -> bool:
+    """Durably fence a provider-accepted artifact before final receipt transition."""
+    if not str(native_message_id or "").strip():
+        raise ValueError("native_message_id is required")
+    with write_txn(conn):
+        return conn.execute(
+            "UPDATE task_delivery_outbox SET native_message_id=? "
+            "WHERE task_id=? AND state='sending' AND send_attempt_token=? AND native_message_id IS NULL",
+            (str(native_message_id), task_id, send_attempt_token),
+        ).rowcount == 1
 
 
 
@@ -4793,7 +4876,8 @@ create_task = _guard_creator_task_mutation(create_task)
 for _mutation_name in (
     "assign_task", "set_model_override", "set_reasoning_effort", "add_comment",
     "store_attachment_bytes", "add_attachment", "record_delivery_receipt",
-    "publish_usable_output", "record_usable_output_delivery", "record_outbox_delivery",
+    "publish_usable_output", "begin_usable_output_send_attempt", "reset_usable_output_send_attempt",
+    "mark_usable_output_native_ack", "reconcile_usable_output_delivery", "record_outbox_delivery",
     "edit_completed_task_result", "complete_task", "block_task", "request_review",
     "request_changes", "promote_task", "unblock_task", "reopen_review_task",
     "specify_triage_task", "archive_task", "delete_archived_task", "delete_task",

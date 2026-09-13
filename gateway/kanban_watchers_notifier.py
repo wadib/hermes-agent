@@ -500,6 +500,20 @@ class _KanbanNotification:
         if getattr(result, "success", False) is not True or not getattr(result, "message_id", None):
             raise RuntimeError("artifact upload did not return a persisted native message id")
 
+        def persist_native_ack():
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+            with kbc.connect(board=self.board_slug) as conn:
+                return kb.mark_outbox_native_ack(
+                    conn, self.task_id, send_attempt_token=attempt_token,
+                    native_message_id=str(result.message_id),
+                )
+
+        if not await _to_thread_process_service(persist_native_ack):
+            raise RuntimeError("native artifact acknowledgement could not be fenced for reconciliation")
+        # Any later failure is post-acceptance ambiguity, never reset/retry.
+        self._outbox_attempt_token = None
+
         def persist_receipt():
             from hermes_cli import kanban_db as kb
             from hermes_cli import kanban_db_connect as kbc
@@ -543,6 +557,24 @@ class _KanbanNotification:
                     return kb.reset_outbox_send_attempt(conn, self.task_id, send_attempt_token=token)
             await _to_thread_process_service(reset_attempt)
             self._outbox_attempt_token = None
+        output_attempt = getattr(self, "_usable_output_attempt", None)
+        if output_attempt:
+            key, token = output_attempt
+            if fails < MAX_SEND_FAILURES:
+                def reset_output_attempt():
+                    from hermes_cli import kanban_db as kb
+                    from hermes_cli import kanban_db_connect as kbc
+                    with kbc.connect(board=self.board_slug) as conn:
+                        return kb.reset_usable_output_send_attempt(
+                            conn, self.task_id, str(key), send_attempt_token=token)
+                await _to_thread_process_service(reset_output_attempt)
+            else:
+                logger.error(
+                    "kanban notifier: usable output for %s exhausted %d provider attempts; "
+                    "retaining the fenced row and subscription for reconciliation",
+                    self.task_id, MAX_SEND_FAILURES,
+                )
+            self._usable_output_attempt = None
         await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
@@ -632,13 +664,90 @@ class _KanbanNotification:
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source)
         self._log_woke()
 
+    async def _send_usable_output(self, ev: Any, msg: str, metadata: dict[str, Any]) -> None:
+        """Deliver or reconcile one globally fenced running-task output."""
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+
+        key = _payload(ev, "idempotency_key")
+        if not key:
+            raise RuntimeError("usable output event has no durable idempotency key")
+        key = str(key)
+
+        def load_output():
+            with kbc.connect(board=self.board_slug) as conn:
+                return kb.get_usable_output_outbox(conn, self.task_id, key)
+
+        row = await _to_thread_process_service(load_output)
+        if row is None:
+            raise RuntimeError("usable output event has no durable outbox row")
+        if row["state"] == "delivered":
+            return
+        if row["state"] == "sending":
+            token = str(row["send_attempt_token"] or "")
+            if row["native_message_id"] and token:
+                def reconcile_ack():
+                    with kbc.connect(board=self.board_slug) as conn:
+                        return kb.reconcile_usable_output_delivery(
+                            conn, self.task_id, key, send_attempt_token=token)
+                if await _to_thread_process_service(reconcile_ack):
+                    return
+                raise RuntimeError("usable output native acknowledgement could not be reconciled")
+            raise RuntimeError(
+                "usable output send is awaiting native receipt reconciliation; refusing a duplicate send")
+
+        def begin_attempt():
+            with kbc.connect(board=self.board_slug) as conn:
+                return kb.begin_usable_output_send_attempt(conn, self.task_id, key)
+
+        token = await _to_thread_process_service(begin_attempt)
+        if not token:
+            raise RuntimeError("usable output send attempt was already claimed; refusing a duplicate send")
+        self._usable_output_attempt = (key, token)
+        result = await self.adapter.send(self.sub["chat_id"], msg, metadata=metadata)
+        if getattr(result, "success", None) is False:
+            raise RuntimeError(
+                f"adapter send() reported failure: {getattr(result, 'error', None) or 'unknown error'}")
+
+        # Anything except an explicit provider failure may already be visible.
+        # From here onward no generic failure handler may reset and resend it.
+        self._usable_output_attempt = None
+        native_id = getattr(result, "message_id", None)
+        if getattr(result, "success", None) is not True or not native_id:
+            raise RuntimeError("usable output send did not return a persisted native message id")
+
+        def persist_native_ack():
+            with kbc.connect(board=self.board_slug) as conn:
+                return kb.mark_usable_output_native_ack(
+                    conn, self.task_id, key, send_attempt_token=token,
+                    platform=self.platform_str, conversation_ref=str(self.sub["chat_id"]),
+                    thread_id=self.sub.get("thread_id") or None,
+                    session_ref=getattr(self.task, "session_id", None),
+                    native_message_id=str(native_id))
+
+        if not await _to_thread_process_service(persist_native_ack):
+            raise RuntimeError("usable output native acknowledgement could not be fenced")
+
+        def persist_receipt():
+            with kbc.connect(board=self.board_slug) as conn:
+                return kb.reconcile_usable_output_delivery(
+                    conn, self.task_id, key, send_attempt_token=token)
+
+        if not await _to_thread_process_service(persist_receipt):
+            raise RuntimeError("usable output native receipt could not be persisted")
+
     async def _send_event(self, ev: Any, msg: str) -> None:
-        """Send one text ping; raises on adapter exception or SendResult(success=False)."""
+        """Send one text ping; durable outputs use their token-fenced state machine."""
         sub, adapter = self.sub, self.adapter
         delivery_metadata = sub.get("delivery_metadata")
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
+        if ev.kind == "usable_output":
+            await self._send_usable_output(ev, msg, metadata)
+            logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                         ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
+            return
         _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the
@@ -647,21 +756,6 @@ class _KanbanNotification:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
-        if ev.kind == "usable_output":
-            key = _payload(ev, "idempotency_key")
-            native_id = getattr(_send_res, "message_id", None)
-            if not key or not native_id:
-                raise RuntimeError("usable output send did not return an idempotency key and native message id")
-            def persist_output_receipt():
-                from hermes_cli import kanban_db as kb
-                from hermes_cli import kanban_db_connect as kbc
-                with kbc.connect(board=self.board_slug) as conn:
-                    return kb.record_usable_output_delivery(
-                        conn, self.task_id, idempotency_key=str(key), platform=self.platform_str,
-                        conversation_ref=str(sub["chat_id"]), session_ref=getattr(self.task, "session_id", None),
-                        native_message_id=str(native_id))
-            if not await _to_thread_process_service(persist_output_receipt):
-                raise RuntimeError("usable output native receipt could not be persisted")
         # Upload artifact paths from the completion payload / legacy result as
         # native files. Only on ``completed`` so retries never spam attachments.
         if ev.kind == "completed":
