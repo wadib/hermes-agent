@@ -197,13 +197,17 @@ def _require_orchestrator_tool(tool_name: str) -> None:
 
 
 @contextmanager
-def _board(board: Optional[str], *, quiet_close: bool = False):
+def _board(board: Optional[str], *, quiet_close: bool = False, ignore_db_env: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
-    contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
-    overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
+    contexts. ``board=None`` keeps the env/symlink resolution chain. An explicitly
+    targeted creation may bypass the worker's source-board DB pin only; all normal
+    worker lifecycle access remains pinned. ``quiet_close`` swallows close() errors."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
-    conn = kbc.connect(board=board)
+    conn = kbc.connect(
+        db_path=kb.kanban_db_path(board, respect_env=False) if ignore_db_env else None,
+        board=None if ignore_db_env else board,
+    )
     try:
         yield kb, conn
     finally:
@@ -520,10 +524,13 @@ def _worker_mutation_board(board: Optional[str], task_id: str):
 
 @contextmanager
 def _creation_mutation_board(board: Optional[str], source_task_id: Optional[str]):
-    """Carry a worker's source-board authority into an explicitly targeted child board."""
+    """Carry source-worker authority while isolating an explicit target board."""
     if source_task_id and board:
+        # Verify source authority against the worker's injected DB first. Then
+        # open the explicit destination without letting HERMES_KANBAN_DB redirect
+        # it back to that source board.
         with _worker_mutation_board(None, source_task_id):
-            with _board(board) as target:
+            with _board(board, ignore_db_env=True) as target:
                 yield target
         return
     with _worker_mutation_board(board, source_task_id or "") as target:

@@ -833,6 +833,17 @@ _NOTIFY_SUB_COLUMNS = (
     ("delivery_metadata", "delivery_metadata TEXT"),
 )
 
+_DELIVERY_OUTBOX_COLUMNS = (
+    ("thread_id", "thread_id TEXT"),
+    ("subscription_identity", "subscription_identity TEXT"),
+    ("send_attempt_token", "send_attempt_token TEXT"),
+    ("send_attempted_at", "send_attempted_at INTEGER"),
+)
+
+_USABLE_OUTPUT_OUTBOX_COLUMNS = (
+    ("not_before_at", "not_before_at INTEGER NOT NULL DEFAULT 0"),
+)
+
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -905,6 +916,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     "UPDATE kanban_notify_subs SET delivery_mode = 'notify+wake' "
                     "WHERE platform != 'tui'"
                 )
+
+    if _table_exists(conn, "task_delivery_outbox"):
+        delivery_cols = _column_names(conn, "task_delivery_outbox")
+        for name, ddl in _DELIVERY_OUTBOX_COLUMNS:
+            if name not in delivery_cols:
+                _add_column_if_missing(conn, "task_delivery_outbox", name, ddl)
+
+    if _table_exists(conn, "task_usable_output_outbox"):
+        output_cols = _column_names(conn, "task_usable_output_outbox")
+        for name, ddl in _USABLE_OUTPUT_OUTBOX_COLUMNS:
+            if name not in output_cols:
+                _add_column_if_missing(conn, "task_usable_output_outbox", name, ddl)
+        # Existing boards may contain multiple pending historical outputs. Keep
+        # the newest one as the explicit current-state record before enforcing
+        # the one-pending invariant.
+        conn.execute(
+            "DELETE FROM task_usable_output_outbox WHERE state='pending' AND rowid NOT IN ("
+            "SELECT MAX(rowid) FROM task_usable_output_outbox WHERE state='pending' GROUP BY task_id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_usable_output_one_pending "
+            "ON task_usable_output_outbox(task_id) WHERE state='pending'"
+        )
 
     if _table_exists(conn, "task_runs"):
         _backfill_legacy_inflight_runs(conn)

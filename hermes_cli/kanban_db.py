@@ -119,6 +119,11 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
+# Running workers may publish progress, but the board must retain only one
+# current undelivered output and pace subsequent sends per task.
+KANBAN_USABLE_OUTPUT_MAX_KEY_CHARS = 128
+KANBAN_USABLE_OUTPUT_MAX_CONTENT_CHARS = 4_000
+KANBAN_USABLE_OUTPUT_MIN_DELIVERY_INTERVAL_SECONDS = 30
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -490,10 +495,14 @@ def _board_path(
     return board_dir(slug) / leaf
 
 
-def kanban_db_path(board: Optional[str] = None) -> Path:
-    """``kanban.db`` path: ``HERMES_KANBAN_DB`` pins it (injected into workers);
-    ``default`` -> ``<root>/kanban.db`` (back-compat), else the board dir."""
-    return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
+def kanban_db_path(board: Optional[str] = None, *, respect_env: bool = True) -> Path:
+    """Resolve a board DB path.
+
+    Worker ownership pins ``HERMES_KANBAN_DB`` for its source board. An
+    explicitly named target board may opt out of that pin; otherwise a worker
+    could create target-board work back on its source board.
+    """
+    return _board_path("HERMES_KANBAN_DB" if respect_env else None, board, ("kanban.db",), "kanban.db")
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -873,6 +882,10 @@ class DeliveryOutbox:
     native_message_id: Optional[str]
     created_at: int
     delivered_at: Optional[int]
+    thread_id: Optional[str] = None
+    subscription_identity: Optional[str] = None
+    send_attempt_token: Optional[str] = None
+    send_attempted_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "DeliveryOutbox":
@@ -881,6 +894,10 @@ class DeliveryOutbox:
             platform=row["platform"], conversation_ref=row["conversation_ref"],
             session_ref=row["session_ref"], native_message_id=row["native_message_id"],
             created_at=int(row["created_at"]), delivered_at=_opt_int(row["delivered_at"]),
+            thread_id=_row_get(row, "thread_id") or None,
+            subscription_identity=_row_get(row, "subscription_identity") or None,
+            send_attempt_token=_row_get(row, "send_attempt_token") or None,
+            send_attempted_at=_opt_int(_row_get(row, "send_attempted_at")),
         )
 
 
@@ -1110,8 +1127,12 @@ CREATE TABLE IF NOT EXISTS task_delivery_outbox (
     state             TEXT NOT NULL DEFAULT 'pending',
     platform          TEXT,
     conversation_ref  TEXT,
+    thread_id         TEXT,
+    subscription_identity TEXT,
     session_ref       TEXT,
     native_message_id TEXT,
+    send_attempt_token TEXT,
+    send_attempted_at INTEGER,
     created_at        INTEGER NOT NULL,
     delivered_at      INTEGER
 );
@@ -1126,9 +1147,14 @@ CREATE TABLE IF NOT EXISTS task_usable_output_outbox (
     session_ref       TEXT,
     native_message_id TEXT,
     created_at        INTEGER NOT NULL,
+    not_before_at     INTEGER NOT NULL DEFAULT 0,
     delivered_at      INTEGER,
     PRIMARY KEY (task_id, idempotency_key)
 );
+-- Exactly one mutable, latest-state output waits per task. Delivered rows
+-- remain as receipts; a new pending row is held until its durable rate time.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usable_output_one_pending
+    ON task_usable_output_outbox(task_id) WHERE state = 'pending';
 
 CREATE TABLE IF NOT EXISTS task_mutation_leases (
     scope_kind TEXT NOT NULL,
@@ -2062,21 +2088,64 @@ def get_delivery_outbox(conn: sqlite3.Connection, task_id: str) -> Optional[Deli
 
 
 def publish_usable_output(conn: sqlite3.Connection, task_id: str, *, idempotency_key: str, content: str) -> bool:
-    """Durably queue one useful running-task output without completing the task."""
+    """Durably retain current useful running-task output for paced delivery.
+
+    A task has at most one pending output. A later update while that output is
+    pending is explicitly coalesced into the same durable key and event, so the
+    notifier sends the latest state once rather than flooding the origin. After
+    a receipt, a new row is held until the per-task delivery interval elapses.
+    """
     key, body = str(idempotency_key or "").strip(), str(content or "").strip()
     if not key or not body:
         raise ValueError("idempotency_key and content are required")
+    if len(key) > KANBAN_USABLE_OUTPUT_MAX_KEY_CHARS:
+        raise ValueError(f"idempotency_key exceeds {KANBAN_USABLE_OUTPUT_MAX_KEY_CHARS} characters")
+    if len(body) > KANBAN_USABLE_OUTPUT_MAX_CONTENT_CHARS:
+        raise ValueError(f"content exceeds {KANBAN_USABLE_OUTPUT_MAX_CONTENT_CHARS} characters")
+    now = int(time.time())
     with write_txn(conn):
         task = get_task(conn, task_id)
         if task is None or task.status != "running":
             return False
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO task_usable_output_outbox (task_id, idempotency_key, content, created_at) VALUES (?, ?, ?, ?)",
-            (task_id, key, body, int(time.time())),
-        )
-        if cur.rowcount:
-            conn.execute("UPDATE tasks SET last_progress_at=? WHERE id=? AND status='running'", (int(time.time()), task_id))
-            _append_event(conn, task_id, "usable_output", {"idempotency_key": key, "content": body[:400]})
+        pending = conn.execute(
+            "SELECT rowid, idempotency_key FROM task_usable_output_outbox "
+            "WHERE task_id=? AND state='pending' ORDER BY rowid DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if pending is not None:
+            durable_key = str(pending["idempotency_key"])
+            # A retry under the existing caller key is idempotent: preserve the
+            # original payload exactly. A distinct later key is current-state
+            # coalesced into the one pending durable notification.
+            if durable_key != key:
+                conn.execute(
+                    "UPDATE task_usable_output_outbox SET content=?, created_at=? WHERE rowid=?",
+                    (body, now, pending["rowid"]),
+                )
+                event = conn.execute(
+                    "SELECT id FROM task_events WHERE task_id=? AND kind='usable_output' "
+                    "ORDER BY id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                payload = {"idempotency_key": durable_key, "content": body[:400], "coalesced": True}
+                if event is not None:
+                    conn.execute("UPDATE task_events SET payload=?, created_at=? WHERE id=?", (_json_or_null(payload), now, event["id"]))
+                else:
+                    _append_event(conn, task_id, "usable_output", payload)
+        else:
+            latest = conn.execute(
+                "SELECT delivered_at FROM task_usable_output_outbox WHERE task_id=? AND state='delivered' "
+                "ORDER BY delivered_at DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            not_before_at = max(now, int(latest["delivered_at"] or 0) + KANBAN_USABLE_OUTPUT_MIN_DELIVERY_INTERVAL_SECONDS) if latest else now
+            conn.execute(
+                "INSERT INTO task_usable_output_outbox "
+                "(task_id, idempotency_key, content, created_at, not_before_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, key, body, now, not_before_at),
+            )
+            _append_event(conn, task_id, "usable_output", {
+                "idempotency_key": key, "content": body[:400],
+                "not_before_at": not_before_at if not_before_at > now else None,
+            })
+        conn.execute("UPDATE tasks SET last_progress_at=? WHERE id=? AND status='running'", (now, task_id))
     return True
 
 
@@ -2084,6 +2153,11 @@ def get_usable_output_outbox(conn: sqlite3.Connection, task_id: str, idempotency
     return conn.execute(
         "SELECT * FROM task_usable_output_outbox WHERE task_id=? AND idempotency_key=?", (task_id, idempotency_key),
     ).fetchone()
+
+
+def usable_output_ready(conn: sqlite3.Connection, task_id: str, idempotency_key: str) -> bool:
+    row = get_usable_output_outbox(conn, task_id, idempotency_key)
+    return bool(row and row["state"] == "pending" and int(row["not_before_at"] or 0) <= int(time.time()))
 
 
 def record_usable_output_delivery(
@@ -2178,13 +2252,64 @@ def _enqueue_delivery_outbox(conn: sqlite3.Connection, task_id: str) -> Optional
     return get_delivery_outbox(conn, task_id)
 
 
+def _subscription_identity(
+    user_id: Optional[str], user_id_alt: Optional[str], *, platform: str = "", chat_id: str = "", thread_id: str = "",
+) -> Optional[str]:
+    value = str(user_id_alt or user_id or "").strip()
+    if value:
+        return ("alt:" if user_id_alt else "user:") + value
+    route = (str(platform).strip().lower(), str(chat_id).strip(), str(thread_id or ""))
+    return "route:" + "\0".join(route) if all(route[:2]) else None
+
+
+def begin_outbox_send_attempt(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Fence an artifact send before it reaches a provider.
+
+    Generic adapters expose no provider idempotency/reconciliation contract.
+    Therefore a crash after provider acceptance but before receipt persistence is
+    an unknown delivery, not a retry-safe send: retain ``sending`` and require
+    reconciliation instead of duplicating the user-visible artifact.
+    """
+    token = secrets.token_hex(16)
+    with write_txn(conn):
+        row = get_delivery_outbox(conn, task_id)
+        task = get_task(conn, task_id)
+        if row is None or task is None or task.status != "delivery_pending" or row.state != "pending":
+            return None
+        if conn.execute(
+            "UPDATE task_delivery_outbox SET state='sending', send_attempt_token=?, send_attempted_at=? "
+            "WHERE task_id=? AND state='pending'",
+            (token, int(time.time()), task_id),
+        ).rowcount != 1:
+            return None
+    return token
+
+
+
+def reset_outbox_send_attempt(conn: sqlite3.Connection, task_id: str, *, send_attempt_token: str) -> bool:
+    """Return a confirmed pre-send/provider failure to the exact pending outbox.
+
+    This is deliberately token-fenced: it cannot rewind an ambiguous post-send
+    attempt owned by another notifier or erase a persisted native receipt.
+    """
+    with write_txn(conn):
+        return conn.execute(
+            "UPDATE task_delivery_outbox SET state='pending', send_attempt_token=NULL, send_attempted_at=NULL "
+            "WHERE task_id=? AND state='sending' AND send_attempt_token=? AND native_message_id IS NULL",
+            (task_id, send_attempt_token),
+        ).rowcount == 1
+
+
 def record_outbox_delivery(
     conn: sqlite3.Connection, task_id: str, *, platform: str, conversation_ref: str,
-    session_ref: Optional[str], native_message_id: str,
+    thread_id: Optional[str], subscription_identity: Optional[str], session_ref: Optional[str],
+    native_message_id: str, send_attempt_token: Optional[str] = None,
 ) -> bool:
-    """Write a platform-native persisted delivery receipt, never an acceptance."""
+    """Persist a platform-native delivery receipt from the exact subscribed route."""
     if not all(str(value or "").strip() for value in (platform, conversation_ref, native_message_id)):
         raise ValueError("platform, conversation_ref, and native_message_id are required")
+    if not str(subscription_identity or "").strip():
+        raise ValueError("subscription_identity is required")
     now = int(time.time())
     with write_txn(conn):
         task = get_task(conn, task_id)
@@ -2193,25 +2318,27 @@ def record_outbox_delivery(
         outbox = get_delivery_outbox(conn, task_id)
         if outbox is None:
             return False
-        # A retried notifier can observe the same native receipt after the
-        # status already moved. Preserve the first durable receipt; never
-        # reopen/rewrite it merely to acknowledge a duplicate delivery event.
         if outbox.state == "delivered":
-            return (outbox.platform, outbox.conversation_ref, outbox.native_message_id) == (
-                platform, conversation_ref, native_message_id)
-        if task.status != "delivery_pending":
+            return (outbox.platform, outbox.conversation_ref, outbox.thread_id, outbox.native_message_id) == (
+                platform, conversation_ref, str(thread_id or "") or None, native_message_id)
+        if task.status != "delivery_pending" or outbox.state not in {"pending", "sending"}:
+            return False
+        if outbox.state == "sending" and outbox.send_attempt_token != send_attempt_token:
             return False
         cur = conn.execute(
-            "UPDATE task_delivery_outbox SET state='delivered', platform=?, conversation_ref=?, session_ref=?, "
-            "native_message_id=?, delivered_at=? WHERE task_id=? AND state='pending'",
-            (platform, conversation_ref, session_ref or None, native_message_id, now, task_id),
+            "UPDATE task_delivery_outbox SET state='delivered', platform=?, conversation_ref=?, thread_id=?, "
+            "subscription_identity=?, session_ref=?, native_message_id=?, delivered_at=? "
+            "WHERE task_id=? AND state IN ('pending', 'sending')",
+            (platform, conversation_ref, str(thread_id or "") or None, subscription_identity, session_ref or None,
+             native_message_id, now, task_id),
         )
         if cur.rowcount != 1:
             return False
         conn.execute("UPDATE tasks SET status='awaiting_acceptance' WHERE id=? AND status='delivery_pending'", (task_id,))
         _append_event(conn, task_id, "delivery_recorded", {
-            "platform": platform, "conversation_ref": conversation_ref, "session_ref": session_ref or None,
-            "native_message_id": native_message_id, "artifact_handle": outbox.artifact_handle,
+            "platform": platform, "conversation_ref": conversation_ref, "thread_id": str(thread_id or "") or None,
+            "session_ref": session_ref or None, "native_message_id": native_message_id,
+            "artifact_handle": outbox.artifact_handle,
         })
     return True
 
@@ -2240,7 +2367,8 @@ def accept_delivery_from_gateway(
         outbox = get_delivery_outbox(conn, task_id)
         if task is None or task.status != "awaiting_acceptance" or outbox is None or outbox.state != "delivered":
             return False
-        if (outbox.platform or "").lower() != platform.lower() or outbox.conversation_ref != chat_id:
+        if ((outbox.platform or "").lower() != platform.lower() or outbox.conversation_ref != chat_id
+                or (outbox.thread_id or "") != thread_id):
             return False
         sub = conn.execute(
             "SELECT user_id, user_id_alt FROM kanban_notify_subs "
@@ -2249,8 +2377,15 @@ def accept_delivery_from_gateway(
         ).fetchone()
         if sub is None or not (user_id or user_id_alt):
             return False
-        allowed_ids = {str(value) for value in (sub["user_id"], sub["user_id_alt"]) if value}
-        if not allowed_ids.intersection({value for value in (user_id, user_id_alt) if value}):
+        expected_identity = _subscription_identity(
+            sub["user_id"], sub["user_id_alt"], platform=platform, chat_id=chat_id, thread_id=thread_id,
+        )
+        if outbox.subscription_identity != expected_identity:
+            return False
+        inbound_identity = _subscription_identity(
+            user_id, user_id_alt, platform=platform, chat_id=chat_id, thread_id=thread_id,
+        )
+        if inbound_identity != outbox.subscription_identity:
             return False
         if get_task_acceptance(conn, task_id) is not None:
             return False
@@ -4044,10 +4179,19 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
-    """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    """Delete every task-scoped row without touching shared mutation domains."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "task_delivery_receipts", "kanban_notify_subs"):
+    for table in (
+        "task_comments", "task_events", "task_runs", "task_delivery_receipts",
+        "task_delivery_outbox", "task_usable_output_outbox", "task_acceptances", "kanban_notify_subs",
+    ):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
+    # Workspace and workspace-session leases can be shared by a sibling task;
+    # deleting them here would fence a still-live writer. Only the task scope is
+    # owned exclusively by this task.
+    conn.execute(
+        "DELETE FROM task_mutation_leases WHERE scope_kind = 'task' AND scope_key = ?", (task_id,),
+    )
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:

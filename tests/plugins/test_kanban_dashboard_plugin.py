@@ -247,7 +247,8 @@ def test_dashboard_accept_delivery_cannot_forge_user_acceptance(client, tmp_path
         kb.add_attachment(conn, task_id, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
         assert kb.complete_task(conn, task_id, summary="technical complete")
         assert kb.record_outbox_delivery(
-            conn, task_id, platform="telegram", conversation_ref="chat-1", session_ref="s-1", native_message_id="m-1",
+            conn, task_id, platform="telegram", conversation_ref="chat-1", thread_id=None,
+            subscription_identity="route:telegram\0chat-1\0", session_ref="s-1", native_message_id="m-1",
         )
 
     response = client.post(f"/api/plugins/kanban/tasks/{task_id}/accept-delivery", json={"user_message_ref": "forged"})
@@ -264,7 +265,8 @@ def test_dashboard_renders_awaiting_acceptance_as_a_distinct_lane(client, tmp_pa
         kb.add_attachment(conn, task_id, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
         assert kb.complete_task(conn, task_id, summary="technical complete")
         assert kb.record_outbox_delivery(
-            conn, task_id, platform="telegram", conversation_ref="chat-1", session_ref="s-1", native_message_id="m-1",
+            conn, task_id, platform="telegram", conversation_ref="chat-1", thread_id=None,
+            subscription_identity="route:telegram\0chat-1\0", session_ref="s-1", native_message_id="m-1",
         )
 
     columns = {column["name"]: column["tasks"] for column in client.get("/api/plugins/kanban/board").json()["columns"]}

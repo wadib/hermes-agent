@@ -898,7 +898,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_notifier_persists_native_artifact_delivery_receipt_once(kanban_home, tmp_path):
+async def test_notifier_retries_confirmed_artifact_send_failures_without_losing_subscription(kanban_home, tmp_path):
     """A delivery-required completion remains pending until the notifier has a native upload receipt."""
     from gateway.config import Platform
     from gateway.platforms.base import SendResult
@@ -920,7 +920,14 @@ async def test_notifier_persists_native_artifact_delivery_receipt_once(kanban_ho
     runner._running = True
     runner._kanban_sub_fail_counts = {}
     fake_adapter = MagicMock()
-    fake_adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="native-file-1"))
+    attempts = 0
+    async def send_document(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("confirmed provider failure before native id")
+        return SendResult(success=True, message_id="native-file-1")
+    fake_adapter.send_document = AsyncMock(side_effect=send_document)
     fake_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="native-text-1"))
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
@@ -931,7 +938,7 @@ async def test_notifier_persists_native_artifact_delivery_receipt_once(kanban_ho
         nonlocal ticks
         await original_sleep(0)
         ticks += 1
-        if ticks >= 3:
+        if ticks >= 5:
             runner._running = False
 
     with patch("gateway.run.asyncio.sleep", side_effect=fast_sleep):
@@ -943,7 +950,9 @@ async def test_notifier_persists_native_artifact_delivery_receipt_once(kanban_ho
         assert outbox.state == "delivered"
         assert outbox.native_message_id == "native-file-1"
         assert kb.get_task(conn, task_id).status == "awaiting_acceptance"
-    fake_adapter.send_document.assert_awaited_once()
+    assert len(kbn.list_notify_subs(kbc.connect(), task_id)) == 1
+    assert attempts == 3
+    assert fake_adapter.send_document.await_count == 3
 
 
 # ---------------------------------------------------------------------------

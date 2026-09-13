@@ -231,6 +231,19 @@ class _Collector:
         )
         if not events:
             return None
+        # A paced usable-output event stays at the head of this subscription's
+        # durable cursor until due. Rewind rather than drop it: current output
+        # remains persisted and later updates coalesce into that same record.
+        for event in events:
+            if event.kind != "usable_output":
+                continue
+            key = (event.payload or {}).get("idempotency_key")
+            if key and not self.kb.usable_output_ready(conn, sub["task_id"], str(key)):
+                _kbn().rewind_notify_cursor(
+                    conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "", claimed_cursor=cursor, old_cursor=old_cursor,
+                )
+                return None
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
@@ -436,11 +449,11 @@ class _KanbanNotification:
         self.sub_fail_counts.pop(self.sub_key, None)
 
     async def _deliver_required_artifact(self) -> None:
-        """Upload the one outbox artifact, then persist the native upload id.
+        """Upload one artifact after durably fencing a single provider attempt.
 
-        The outbound send remains at-least-once across a process crash, but the
-        durable outbox receipt is checked before every retry so repeated events
-        and post-send cursor retries never create a second upload.
+        Generic adapters cannot reconcile a provider send by idempotency token.
+        A post-send/pre-receipt crash remains ``sending`` and is deliberately
+        retried as reconciliation work, never as a second blind upload.
         """
         def load_outbox():
             from hermes_cli import kanban_db as kb
@@ -459,6 +472,19 @@ class _KanbanNotification:
             return
         if task.status != "delivery_pending":
             return
+        if outbox.state == "sending":
+            raise RuntimeError("artifact send is awaiting native receipt reconciliation; refusing a duplicate upload")
+
+        def begin_attempt():
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_db_connect as kbc
+            with kbc.connect(board=self.board_slug) as conn:
+                return kb.begin_outbox_send_attempt(conn, self.task_id)
+
+        attempt_token = await _to_thread_process_service(begin_attempt)
+        if not attempt_token:
+            raise RuntimeError("artifact send attempt was already claimed; refusing a duplicate upload")
+        self._outbox_attempt_token = attempt_token
         from gateway.platforms.base import BasePlatformAdapter
 
         paths = BasePlatformAdapter.filter_local_delivery_paths([outbox.artifact_handle])
@@ -480,10 +506,15 @@ class _KanbanNotification:
 
             conn = kbc.connect(board=self.board_slug)
             try:
+                identity = kb._subscription_identity(
+                    self.sub.get("user_id"), self.sub.get("user_id_alt"), platform=self.platform_str,
+                    chat_id=str(self.sub["chat_id"]), thread_id=str(self.sub.get("thread_id") or ""),
+                )
                 return kb.record_outbox_delivery(
                     conn, self.task_id, platform=self.platform_str,
-                    conversation_ref=str(self.sub["chat_id"]),
-                    session_ref=getattr(task, "session_id", None), native_message_id=str(result.message_id),
+                    conversation_ref=str(self.sub["chat_id"]), thread_id=self.sub.get("thread_id") or None,
+                    subscription_identity=identity, session_ref=getattr(task, "session_id", None),
+                    native_message_id=str(result.message_id), send_attempt_token=attempt_token,
                 )
             finally:
                 conn.close()
@@ -496,16 +527,23 @@ class _KanbanNotification:
             await self._deliver_required_artifact()
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
-        """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
+        """Durably rewind a failed delivery; subscriptions are retained for delivery-required work."""
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
-        if fails >= MAX_SEND_FAILURES:
-            logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
-            await self.unsub()
-            self.clear_failures()
-        else:
-            await self.rewind()
+        # A provider exception before it returned a native id is confirmed
+        # pre-send failure: release only this fenced attempt for retry. A
+        # post-send ambiguity has no safe token reset path and remains sending.
+        token = getattr(self, "_outbox_attempt_token", None)
+        if token:
+            def reset_attempt():
+                from hermes_cli import kanban_db as kb
+                from hermes_cli import kanban_db_connect as kbc
+                with kbc.connect(board=self.board_slug) as conn:
+                    return kb.reset_outbox_send_attempt(conn, self.task_id, send_attempt_token=token)
+            await _to_thread_process_service(reset_attempt)
+            self._outbox_attempt_token = None
+        await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"

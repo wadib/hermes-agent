@@ -32,7 +32,8 @@ async def test_gateway_acceptance_requires_matching_authenticated_delivery_sourc
         kb.add_attachment(conn, task_id, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
         assert kb.complete_task(conn, task_id, summary="technical completion")
         assert kb.record_outbox_delivery(
-            conn, task_id, platform="telegram", conversation_ref="chat-1", session_ref="s-1", native_message_id="out-1",
+            conn, task_id, platform="telegram", conversation_ref="chat-1", thread_id=None,
+            subscription_identity="user:wessam", session_ref="s-1", native_message_id="out-1",
         )
         kbn.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat-1", user_id="wessam")
 
@@ -44,6 +45,12 @@ async def test_gateway_acceptance_requires_matching_authenticated_delivery_sourc
         MessageEvent(text=f"/accept {task_id}", source=rejected_source, message_id="in-1"), rejected_source,
     )
     assert rejected == "Acceptance refused: no delivered task matched this authenticated delivery route."
+
+    # Same user/chat but a different thread is not the delivered route.
+    assert not kb.accept_delivery_from_gateway(
+        kbc.connect(), task_id, platform="telegram", chat_id="chat-1", thread_id="other-thread",
+        user_id="wessam", user_id_alt=None, inbound_message_id="wrong-thread",
+    )
 
     accepted_source = SessionSource(
         platform=Platform.TELEGRAM, chat_id="chat-1", user_id="wessam", message_id="in-2",

@@ -356,8 +356,8 @@ def test_delivery_outbox_requires_persisted_delivery_and_explicit_acceptance(kan
                 user_message_ref="session:s_1/message:user_1",
             )
         assert kb.record_outbox_delivery(
-            conn, parent, platform="telegram", conversation_ref="chat-1",
-            session_ref="s-1", native_message_id="m_1",
+            conn, parent, platform="telegram", conversation_ref="chat-1", thread_id=None,
+            subscription_identity="user:wessam", session_ref="s-1", native_message_id="m_1",
         )
         assert kb.get_task(conn, parent).status == "awaiting_acceptance"
         assert kb.get_task(conn, child).status == "todo"
@@ -514,6 +514,37 @@ def test_usable_output_is_idempotent_and_receipt_keeps_task_running(kanban_home)
         )
         assert kb.get_task(conn, task).status == "running"
 
+
+def test_delivery_send_attempt_holds_ambiguous_restart_without_false_receipt(kanban_home, tmp_path):
+    """A post-send crash is held for native reconciliation, never blind resend."""
+    artifact = tmp_path / "evidence.txt"
+    artifact.write_text("proof", encoding="utf-8")
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="deliver", delivery_required=True)
+        kb.add_attachment(conn, task, filename=artifact.name, stored_path=str(artifact), size=artifact.stat().st_size)
+        assert kb.complete_task(conn, task, summary="ready")
+        token = kb.begin_outbox_send_attempt(conn, task)
+        assert token
+        # Simulate process loss after provider acknowledgement, before DB receipt.
+        row = kb.get_delivery_outbox(conn, task)
+        assert row and row.state == "sending" and row.native_message_id is None
+        assert kb.begin_outbox_send_attempt(conn, task) is None
+        assert not kb.record_outbox_delivery(
+            conn, task, platform="telegram", conversation_ref="chat", thread_id=None,
+            subscription_identity="user:u", session_ref=None, native_message_id="native-1",
+            send_attempt_token="wrong-token",
+        )
+        assert kb.get_task(conn, task).status == "delivery_pending"
+        assert kb.record_outbox_delivery(
+            conn, task, platform="telegram", conversation_ref="chat", thread_id=None,
+            subscription_identity="user:u", session_ref=None, native_message_id="native-1",
+            send_attempt_token=token,
+        )
+        delivered = kb.get_delivery_outbox(conn, task)
+        assert delivered and delivered.state == "delivered" and delivered.native_message_id == "native-1"
+        assert kb.begin_outbox_send_attempt(conn, task) is None
+
+
 def test_desktop_acceptance_binds_exact_tui_session_and_user_row(kanban_home, tmp_path):
     """Desktop completion cannot be attested by a mismatched session or generic caller."""
     artifact = tmp_path / "desktop-evidence.txt"
@@ -525,8 +556,9 @@ def test_desktop_acceptance_binds_exact_tui_session_and_user_row(kanban_home, tm
         from hermes_cli import kanban_db_notify as kbn
         kbn.add_notify_sub(conn, task_id=task, platform="tui", chat_id="desktop-session")
         assert kb.record_outbox_delivery(
-            conn, task, platform="tui", conversation_ref="desktop-session",
-            session_ref="desktop-session", native_message_id="delivery-row",
+            conn, task, platform="tui", conversation_ref="desktop-session", thread_id=None,
+            subscription_identity="route:tui\0desktop-session\0", session_ref="desktop-session",
+            native_message_id="delivery-row",
         )
         assert not kb.accept_delivery_from_desktop(conn, task, session_key="wrong-session", user_message_id=9)
         assert kb.get_task(conn, task).status == "awaiting_acceptance"
@@ -814,6 +846,16 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
             "VALUES (?, 'telegram', '123', '', 'u', 0, 0)",
             (tid,),
         )
+        # Delivery/outbox/acceptance rows and the task-only lease are owned by
+        # this task. A sibling deliberately shares the workspace/session lease,
+        # which deletion must not release.
+        conn.execute("INSERT INTO task_delivery_outbox(task_id, artifact_handle, state, created_at) VALUES (?, 'artifact', 'pending', 0)", (tid,))
+        conn.execute("INSERT INTO task_usable_output_outbox(task_id, idempotency_key, content, state, created_at, not_before_at) VALUES (?, 'progress', 'x', 'pending', 0, 0)", (tid,))
+        conn.execute("INSERT INTO task_acceptances(task_id, source, accepted_by, user_message_ref, accepted_at) VALUES (?, 'test', 'user', 'msg', 0)", (tid,))
+        # The task-only lease is expired, so archival cleanup is authorized;
+        # the separate shared workspace lease remains live and must survive.
+        conn.execute("INSERT INTO task_mutation_leases(scope_kind, scope_key, holder, fence, expires_at) VALUES ('task', ?, 'holder', 1, 0)", (tid,))
+        conn.execute("INSERT INTO task_mutation_leases(scope_kind, scope_key, holder, fence, expires_at) VALUES ('workspace', 'shared', 'holder', 1, 9999999999)")
         conn.commit()
 
         assert kb.delete_archived_task(conn, tid) is True
@@ -823,6 +865,10 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        for table in ("task_delivery_outbox", "task_usable_output_outbox", "task_acceptances"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_mutation_leases WHERE scope_kind='task' AND scope_key=?", (tid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_mutation_leases WHERE scope_kind='workspace' AND scope_key='shared'").fetchone()[0] == 1
 
 
 def test_delete_task_removes_task_and_cascades(kanban_home):
