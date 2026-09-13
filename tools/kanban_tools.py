@@ -497,6 +497,7 @@ def _worker_mutation_board(board: Optional[str], task_id: str):
     """
     is_worker = (
         os.environ.get("HERMES_KANBAN_TASK") == task_id
+        and bool(os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         and _is_dispatcher_owned_worker()
     )
     with _board(board) as (kb, conn):
