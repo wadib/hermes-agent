@@ -191,6 +191,22 @@ def guard_task_mutator(fn):
     return guarded
 
 
+def guard_attachment_mutator(fn):
+    """Fence attachment deletion through its durable owning task domain."""
+    import functools
+
+    @functools.wraps(fn)
+    def guarded(conn, attachment_id, *args, **kwargs):
+        from hermes_cli import kanban_db as kb
+
+        attachment = kb.get_attachment(conn, attachment_id)
+        if attachment is not None:
+            assert_task_mutation_allowed(conn, attachment.task_id)
+        return fn(conn, attachment_id, *args, **kwargs)
+
+    return guarded
+
+
 def guard_link_mutator(fn):
     """A dependency edge mutates both its parent and child task domains."""
     import functools

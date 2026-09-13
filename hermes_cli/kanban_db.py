@@ -4852,6 +4852,7 @@ from hermes_cli.kanban_db_mutation import (  # noqa: E402
     acquire_worker_mutation_authority,
     assert_task_mutation_allowed,
     current_mutation_authority,
+    guard_attachment_mutator,
     guard_link_mutator,
     guard_task_mutator,
     mutation_authority,
@@ -4873,6 +4874,7 @@ def _guard_creator_task_mutation(fn):
 
 
 create_task = _guard_creator_task_mutation(create_task)
+delete_attachment = guard_attachment_mutator(delete_attachment)
 for _mutation_name in (
     "assign_task", "set_model_override", "set_reasoning_effort", "add_comment",
     "store_attachment_bytes", "add_attachment", "record_delivery_receipt",

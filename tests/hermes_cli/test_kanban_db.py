@@ -442,6 +442,33 @@ def test_canonical_mutation_authority_fences_shared_domains_and_stale_writers(ka
         assert [comment.body for comment in kb.list_comments(conn, first_task)] == ["owned write", "fenced successor"]
 
 
+def test_delete_attachment_inherits_canonical_mutation_lease_guard(kanban_home, tmp_path):
+    """Attachment listing is read-only, while deletion belongs to the owning task lease."""
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="guard attachment")
+        blob = tmp_path / "guarded.txt"
+        blob.write_text("attachment", encoding="utf-8")
+        attachment_id = kb.add_attachment(
+            conn, task, filename=blob.name, stored_path=str(blob), size=blob.stat().st_size,
+        )
+        owner = kb.acquire_task_mutation_authority(conn, task, holder="live-owner")
+        assert owner is not None
+
+        # A competing direct/dashboard caller cannot mutate, but listing remains readable.
+        assert [attachment.id for attachment in kb.list_attachments(conn, task)] == [attachment_id]
+        with pytest.raises(kb.MutationLeaseBusyError):
+            kb.delete_attachment(conn, attachment_id)
+        assert kb.get_attachment(conn, attachment_id) is not None
+        assert not [event for event in kb.list_events(conn, task) if event.kind == "attachment_removed"]
+
+        with kb.mutation_authority(owner):
+            removed = kb.delete_attachment(conn, attachment_id)
+        assert removed is not None and removed.id == attachment_id
+        assert kb.list_attachments(conn, task) == []
+        assert [event.kind for event in kb.list_events(conn, task)].count("attachment_removed") == 1
+        assert not blob.exists()
+
+
 @pytest.mark.parametrize("entry", [
     lambda conn, tid: kb.add_comment(conn, tid, "operator", "x"),
     lambda conn, tid: kb.assign_task(conn, tid, "other"),

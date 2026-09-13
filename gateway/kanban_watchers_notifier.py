@@ -524,6 +524,11 @@ class _KanbanNotification:
         if getattr(result, "success", False) is not True or not getattr(result, "message_id", None):
             raise RuntimeError("artifact upload did not return a persisted native message id")
 
+        # The provider has accepted this upload.  Clear reset eligibility before
+        # any further persistence so a native-ack DB failure remains held rather
+        # than being rewound into a duplicate provider upload.
+        self._outbox_attempt_token = None
+
         def persist_native_ack():
             from hermes_cli import kanban_db as kb
             from hermes_cli import kanban_db_connect as kbc

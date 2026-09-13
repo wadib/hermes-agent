@@ -438,3 +438,74 @@ async def test_fresh_artifact_notifier_holds_sending_row_without_native_evidence
                     if event.kind == "delivery_recorded"]
         assert kb.get_task(conn, task).status == "delivery_pending"
     assert document_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_artifact_native_ack_persistence_failure_holds_without_resend(
+    tmp_path, monkeypatch,
+):
+    """A provider-accepted upload stays held if durable native acknowledgement fails."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+    runner, adapter, _source, _key = setup_route()
+    artifact = tmp_path / "native-ack-db-failure.txt"
+    artifact.write_text("held after accepted upload", encoding="utf-8")
+    document_calls = 0
+
+    async def accepted_document(*_args, **_kwargs):
+        nonlocal document_calls
+        document_calls += 1
+        return SendResult(success=True, message_id="native-but-unpersisted")
+
+    adapter.send_document = accepted_document
+    with kbc.connect() as conn:
+        task = kb.create_task(conn, title="ack persistence failure", delivery_required=True)
+        kb.add_attachment(
+            conn, task, filename=artifact.name, stored_path=str(artifact),
+            size=artifact.stat().st_size,
+        )
+        kbn.add_notify_sub(
+            conn, task_id=task, platform="telegram", chat_id="42",
+            user_id="42", chat_type="dm", delivery_mode="notify",
+        )
+        assert kb.complete_task(conn, task, summary="awaiting artifact delivery")
+
+    rows = await asyncio.to_thread(
+        _notifier_collect, runner, kb, notifier_profile=None,
+        gc_due=False, gc_retention_days=30,
+    )
+    assert len(rows) == 1
+    with monkeypatch.context() as crash:
+        crash.setattr(
+            kb, "mark_outbox_native_ack",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("native ack DB failure")),
+        )
+        await _KanbanNotification(
+            runner, rows[0], platform_cls=Platform, sub_fail_counts={},
+        ).deliver()
+
+    with kbc.connect() as conn:
+        held = kb.get_delivery_outbox(conn, task)
+        assert held is not None
+        assert held.state == "sending"
+        assert held.native_message_id is None
+        assert held.send_attempt_token
+        assert kb.get_task(conn, task).status == "delivery_pending"
+        assert not [event for event in kb.list_events(conn, task)
+                    if event.kind == "delivery_recorded"]
+    assert document_calls == 1
+
+    fresh_rows = await asyncio.to_thread(
+        _notifier_collect, runner, kb, notifier_profile=None,
+        gc_due=False, gc_retention_days=30,
+    )
+    assert len(fresh_rows) == 1
+    await _KanbanNotification(
+        runner, fresh_rows[0], platform_cls=Platform, sub_fail_counts={},
+    ).deliver()
+    with kbc.connect() as conn:
+        held = kb.get_delivery_outbox(conn, task)
+        assert held is not None and held.state == "sending" and held.native_message_id is None
+        assert kb.get_task(conn, task).status == "delivery_pending"
+        assert not [event for event in kb.list_events(conn, task)
+                    if event.kind == "delivery_recorded"]
+    assert document_calls == 1
