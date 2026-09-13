@@ -517,6 +517,18 @@ def _worker_mutation_board(board: Optional[str], task_id: str):
 
 
 
+@contextmanager
+def _creation_mutation_board(board: Optional[str], source_task_id: Optional[str]):
+    """Carry a worker's source-board authority into an explicitly targeted child board."""
+    if source_task_id and board:
+        with _worker_mutation_board(None, source_task_id):
+            with _board(board) as target:
+                yield target
+        return
+    with _worker_mutation_board(board, source_task_id or "") as target:
+        yield target
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
@@ -878,7 +890,7 @@ def _handle_create(args: dict, **kw) -> str:
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                 if _is_dispatcher_owned_worker() else None)
-    with _worker_mutation_board(args.get("board"), self_tid or "") as (kb, conn):
+    with _creation_mutation_board(args.get("board"), self_tid) as (kb, conn):
         from tools.async_delegation import _current_origin_session_id
         self_task = kb.get_task(conn, self_tid) if self_tid else None
         # The worker/API runtime may be transient; the owning task's origin is durable.
