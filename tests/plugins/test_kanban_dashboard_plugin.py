@@ -1352,6 +1352,70 @@ def test_governed_released_task_dashboard_can_reach_ready(client):
 
 
 # ---------------------------------------------------------------------------
+# RIA-012 — APPROVED is one human-facing go action, never a governed bypass.
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_approved_governed_task_requires_release_and_audits_promotion(client):
+    """A7: APPROVED's internal ready promotion must traverse the governed
+    lifecycle boundary. An unreleased governed card is rejected atomically (no
+    approved/status events); after board-owner release it reaches ready and
+    writes the distinct approved audit event plus the ready transition."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="approved governed", governed=True, assignee="relay")
+
+    rejected = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "approved", "approved_by": "wessam"},
+    )
+    assert rejected.status_code == 409, rejected.text
+    with kbc.connect() as conn:
+        row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (task_id,)).fetchone()
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id=?", (task_id,)).fetchall()
+    assert dict(row) == {"status": "todo", "execution_authorized": 0}
+    assert [event["kind"] for event in events] == ["created"]
+
+    with kbc.connect() as conn:
+        ok, reason = kb.release_task(conn, task_id, actor="default", reason="human approved", authorized=True)
+        assert ok, reason
+    accepted = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "approved", "approved_by": "wessam"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    with kbc.connect() as conn:
+        row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (task_id,)).fetchone()
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
+        ).fetchall()
+    assert dict(row) == {"status": "ready", "execution_authorized": 1}
+    assert [event["kind"] for event in events][-2:] == ["approved", "status"]
+    assert json.loads(events[-2]["payload"])["approved_by"] == "wessam"
+    assert json.loads(events[-1]["payload"])["status"] == "ready"
+
+
+def test_dashboard_approved_waits_for_unsatisfied_parent(client):
+    """APPROVED records human approval but does not dispatch/ready a child before
+    its parent is done; when no ready promotion occurs it remains an inert
+    approved card with its audit event."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="relay")
+        child = kb.create_task(conn, title="approved child", assignee="relay")
+        kb.link_tasks(conn, parent, child)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{child}",
+        json={"status": "approved", "approved_by": "wessam"},
+    )
+    assert response.status_code == 200, response.text
+    with kbc.connect() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (child,)).fetchall()
+    assert row["status"] == "approved"
+    assert [event["kind"] for event in events][-1:] == ["approved"]
+
+
+# ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
 

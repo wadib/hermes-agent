@@ -87,7 +87,7 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 # --- Constants ---
 
 VALID_STATUSES = {
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "approved",
     "delivery_pending", "awaiting_acceptance", "done", "archived",
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
