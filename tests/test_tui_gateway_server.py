@@ -10193,7 +10193,7 @@ def test_kanban_desktop_accept_rpc_persists_user_row_before_trusted_acceptance(m
     @contextlib.contextmanager
     def fake_connect(*_args, **_kwargs):
         yield object()
-    def fake_accept(_conn, task_id, *, session_key, user_message_id):
+    def fake_accept(_conn, task_id, *, session_key, user_message_id, accepting_owner=None):
         received.update(task_id=task_id, session_key=session_key, user_message_id=user_message_id)
         return True
 

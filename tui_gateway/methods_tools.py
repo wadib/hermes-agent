@@ -820,9 +820,18 @@ def _(rid, params: dict, session: dict) -> dict:
     with _session_profile_runtime_scope(session):
         kb = _tools_mod("hermes_cli.kanban_db")
         kbc = _tools_mod("hermes_cli.kanban_db_connect")
+        # Slip #002: the accepting owner for a governed task is the live session's
+        # profile, resolved from its runtime home (trusted, not renderer-supplied).
+        try:
+            accepting_owner = _tools_mod("hermes_constants").profile_name_for_home(
+                session.get("profile_home")
+            )
+        except Exception:
+            accepting_owner = None
         with kbc.connect() as conn:
             accepted = kb.accept_delivery_from_desktop(
-                conn, task_id, session_key=session_key, user_message_id=user_message_id)
+                conn, task_id, session_key=session_key, user_message_id=user_message_id,
+                accepting_owner=accepting_owner)
     if not accepted:
         return _err(rid, 4009, "delivery cannot be accepted from this session")
     return _ok(rid, {"task_id": task_id, "status": "done", "user_message_id": user_message_id})

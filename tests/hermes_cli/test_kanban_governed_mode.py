@@ -217,3 +217,97 @@ def test_cli_governed_create_and_release_round_trip(kanban_home):
         evs = [e["kind"] for e in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
         assert "released" in evs
 
+
+# ---------------------------------------------------------------------------
+# Class 4 (part 2) — named acceptance owner is ENFORCED at the accept boundary
+# ---------------------------------------------------------------------------
+
+
+def _deliver_governed_task(conn, *, acceptance_owner):
+    """Drive a governed conversation-origin task to awaiting_acceptance with a
+    delivered telegram outbox + subscription, ready for an accept attempt."""
+    from hermes_cli import kanban_db_notify as kbn
+    tid = kb.create_task(
+        conn, title="gov deliver", assignee="alice", governed=True,
+        session_id="sess-x", acceptance_owner=acceptance_owner,
+    )
+    kb.release_task(conn, tid, actor="hermes", reason="go")
+    kb.claim_task(conn, tid)
+    kb.add_attachment(conn, tid, filename="r.md", stored_path="/tmp/r.md", size=2)
+    assert kb.complete_task(conn, tid, summary="done")
+    assert kb.record_outbox_delivery(
+        conn, tid, platform="telegram", conversation_ref="chat-9", thread_id=None,
+        subscription_identity="user:wessam", session_ref="s-9", native_message_id="out-9",
+    )
+    kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-9", user_id="wessam")
+    return tid
+
+
+def test_governed_acceptance_rejected_for_non_owner_and_accepted_for_owner(kanban_home):
+    """A governed task named to owner 'wessam' cannot be finalized by a different
+    accepting owner; the named owner succeeds."""
+    with kbc.connect() as conn:
+        tid = _deliver_governed_task(conn, acceptance_owner="wessam")
+
+    # Wrong owner -> fail closed, task stays awaiting_acceptance, reject event logged.
+    with kbc.connect() as conn:
+        assert not kb.accept_delivery_from_gateway(
+            conn, tid, platform="telegram", chat_id="chat-9", thread_id=None,
+            user_id="wessam", user_id_alt=None, inbound_message_id="in-a",
+            accepting_owner="atlas",
+        )
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "awaiting_acceptance"
+        kinds = [e["kind"] for e in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert "acceptance_rejected" in kinds
+
+    # Named owner -> accepted to done.
+    with kbc.connect() as conn:
+        assert kb.accept_delivery_from_gateway(
+            conn, tid, platform="telegram", chat_id="chat-9", thread_id=None,
+            user_id="wessam", user_id_alt=None, inbound_message_id="in-b",
+            accepting_owner="wessam",
+        )
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "done"
+
+
+def test_nongoverned_delivery_acceptance_ignores_accepting_owner(kanban_home):
+    """Back-compat: a non-governed delivery-required task accepts without any
+    acceptance-owner constraint (accepting_owner is irrelevant)."""
+    from hermes_cli import kanban_db_notify as kbn
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="legacy deliver", delivery_required=True)
+        kb.add_attachment(conn, tid, filename="r.md", stored_path="/tmp/r.md", size=2)
+        assert kb.complete_task(conn, tid, summary="done")
+        assert kb.record_outbox_delivery(
+            conn, tid, platform="telegram", conversation_ref="chat-3", thread_id=None,
+            subscription_identity="user:wessam", session_ref="s-3", native_message_id="out-3",
+        )
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-3", user_id="wessam")
+    with kbc.connect() as conn:
+        # No accepting_owner supplied at all — legacy path unchanged, accepts.
+        assert kb.accept_delivery_from_gateway(
+            conn, tid, platform="telegram", chat_id="chat-3", thread_id=None,
+            user_id="wessam", user_id_alt=None, inbound_message_id="in-1",
+        )
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Class 1 (part 2) — unblock/reopen cannot queue a governed unreleased task
+# ---------------------------------------------------------------------------
+
+
+def test_unblock_holds_governed_unreleased_task_in_todo(kanban_home):
+    """Unblocking a governed, unreleased task must land it in 'todo', not 'ready'
+    — otherwise it would spin the dispatcher's claim-reject loop."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gov blocked", assignee="alice", governed=True)
+        # A governed unreleased task cannot be claimed; put it directly in blocked
+        # (a real human hold), then unblock.
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+        assert kb.unblock_task(conn, tid)
+        row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "todo", "governed unreleased task must not be queued to ready on unblock"
+        assert row["execution_authorized"] == 0
+

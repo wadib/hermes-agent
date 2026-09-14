@@ -1169,6 +1169,7 @@ class GatewayInboundMixin:
                         conn, task_id, platform=platform, chat_id=source.chat_id,
                         thread_id=source.thread_id, user_id=source.user_id,
                         user_id_alt=source.user_id_alt, inbound_message_id=inbound_message_id,
+                        accepting_owner=getattr(source, "profile", None),
                     ):
                         return str(board)
                 finally:

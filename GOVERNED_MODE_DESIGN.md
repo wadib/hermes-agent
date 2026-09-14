@@ -26,7 +26,8 @@ Add a new per-task column `governed INTEGER NOT NULL DEFAULT 0` (kanban_db.py SC
 
 ### Class 4 — done-before-acceptance / durable origin binding + named acceptance owner
 - Governed + conversation-originated (session_id present) ⇒ delivery_required is enforced True at create (durable origin binding via existing inherit_creator_origin + subscription). complete_task() already routes delivery_required → delivery_pending (:3326), so executor completion reaches pending only, never Done.
-- Named acceptance owner: add `acceptance_owner TEXT` column. Default 'hermes' for internal governed work; caller may set the sensitive-work owner (e.g. 'wessam'). Acceptance paths (accept_delivery_from_gateway/desktop) additionally require the accepting identity to match the named acceptance_owner for governed tasks. Non-governed unchanged.
+- Named acceptance owner: add `acceptance_owner TEXT` column. Default 'hermes' for internal governed work; caller may set the sensitive-work owner (e.g. 'wessam'). Acceptance paths (accept_delivery_from_gateway/desktop) additionally require the accepting identity to match the named acceptance_owner for governed tasks (fail-closed via `_governed_acceptance_owner_ok`; the trusted ingress resolves the accepting owner from its authenticated context — gateway `source.profile`, desktop session `profile_home`). Non-governed unchanged.
+- Class 1 defense-in-depth: `_landing_status_after_parents` (shared by unblock_task/reopen_review_task) also holds a governed-unreleased task in `todo`, so no unblock/reopen path can queue it to `ready` behind the recompute_ready/promote guards.
 
 ## Tests (TDD — RED first, then GREEN), all via scripts/run_tests.sh
 tests/hermes_cli/test_kanban_governed_mode.py (new):

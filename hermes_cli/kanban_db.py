@@ -2492,16 +2492,31 @@ def record_outbox_delivery(
     return True
 
 
+def _governed_acceptance_owner_ok(task: "Task", accepting_owner: Optional[str]) -> bool:
+    """Slip #002: for a governed task with a named ``acceptance_owner``, only that
+    owner may finalize acceptance. The trusted ingress resolves ``accepting_owner``
+    from its authenticated context (the profile/identity performing the accept);
+    a missing or mismatched owner fails closed. Non-governed tasks, or governed
+    tasks without a named owner, are unaffected (legacy acceptance unchanged).
+    """
+    if not (task.governed and (task.acceptance_owner or "").strip()):
+        return True
+    owner = _canonical_assignee(accepting_owner) if accepting_owner else None
+    return owner is not None and owner == _canonical_assignee(task.acceptance_owner)
+
+
 def accept_delivery_from_gateway(
     conn: sqlite3.Connection, task_id: str, *, platform: str, chat_id: str,
     thread_id: Optional[str], user_id: Optional[str], user_id_alt: Optional[str],
-    inbound_message_id: str,
+    inbound_message_id: str, accepting_owner: Optional[str] = None,
 ) -> bool:
     """Accept only from the authenticated gateway source that received delivery.
 
     The caller supplies values taken from a normalized, already-authorized
     ``MessageEvent``; this function independently binds them to the persisted
-    subscription and outbound receipt before allowing ``done``.
+    subscription and outbound receipt before allowing ``done``. Slip #002: a
+    governed task with a named ``acceptance_owner`` is only finalizable by that
+    owner (``accepting_owner``); a non-owner fails closed.
     """
     values = (platform, chat_id, inbound_message_id)
     if not all(str(value or "").strip() for value in values):
@@ -2515,6 +2530,13 @@ def accept_delivery_from_gateway(
         task = get_task(conn, task_id)
         outbox = get_delivery_outbox(conn, task_id)
         if task is None or task.status != "awaiting_acceptance" or outbox is None or outbox.state != "delivered":
+            return False
+        # Slip #002: named-owner gate for governed work (fail-closed).
+        if not _governed_acceptance_owner_ok(task, accepting_owner):
+            _append_event(conn, task_id, "acceptance_rejected", {
+                "reason": "acceptance_owner_mismatch", "required_owner": task.acceptance_owner,
+                "source": "gateway_authenticated_inbound",
+            })
             return False
         if ((outbox.platform or "").lower() != platform.lower() or outbox.conversation_ref != chat_id
                 or (outbox.thread_id or "") != thread_id):
@@ -2558,13 +2580,16 @@ def accept_delivery_from_gateway(
 
 def accept_delivery_from_desktop(
     conn: sqlite3.Connection, task_id: str, *, session_key: str, user_message_id: int,
+    accepting_owner: Optional[str] = None,
 ) -> bool:
     """Accept from the authenticated TUI/Desktop RPC ingress only.
 
     ``session_key`` and ``user_message_id`` are obtained by the live gateway,
     not submitted by the renderer. The caller persists the user-authored row
     before calling this function; this DB boundary binds it to the matching
-    durable tui subscription and outbound receipt.
+    durable tui subscription and outbound receipt. Slip #002: a governed task
+    with a named ``acceptance_owner`` is only finalizable by that owner
+    (``accepting_owner``); a non-owner fails closed.
     """
     session_key = str(session_key or "").strip()
     if not session_key or not isinstance(user_message_id, int) or user_message_id <= 0:
@@ -2574,6 +2599,13 @@ def accept_delivery_from_desktop(
         task = get_task(conn, task_id)
         outbox = get_delivery_outbox(conn, task_id)
         if task is None or task.status != "awaiting_acceptance" or outbox is None or outbox.state != "delivered":
+            return False
+        # Slip #002: named-owner gate for governed work (fail-closed).
+        if not _governed_acceptance_owner_ok(task, accepting_owner):
+            _append_event(conn, task_id, "acceptance_rejected", {
+                "reason": "acceptance_owner_mismatch", "required_owner": task.acceptance_owner,
+                "source": "desktop_authenticated_session",
+            })
             return False
         if (outbox.platform or "").lower() != "tui" or outbox.conversation_ref != session_key:
             return False
@@ -4134,8 +4166,21 @@ def _reclaim_dangling_run(
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
     """``ready`` if every parent is terminal else ``todo`` — the re-gate shared by
-    unblock/reopen so neither can spawn a child whose upstream is unfinished."""
-    return "ready" if _parents_satisfied(conn, task_id) else "todo"
+    unblock/reopen so neither can spawn a child whose upstream is unfinished.
+
+    Slip #002: a governed task that has NOT been released (``execution_authorized=0``)
+    never lands in ``ready`` — else unblock/reopen would queue it for dispatch and
+    spin the claim-reject loop, bypassing the recompute_ready/promote guards. It
+    parks in ``todo`` until an explicit ``release_task``.
+    """
+    if not _parents_satisfied(conn, task_id):
+        return "todo"
+    row = conn.execute(
+        "SELECT governed, execution_authorized FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is not None and _row_get(row, "governed") and not _row_get(row, "execution_authorized"):
+        return "todo"
+    return "ready"
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
