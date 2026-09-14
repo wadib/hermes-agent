@@ -417,3 +417,67 @@ def test_release_rejects_nongoverned_task(kanban_home):
         assert not ok
 
 
+# ---------------------------------------------------------------------------
+# Slip #006 — threat-boundary evidence (BLOCKED-ARCHITECTURE, see
+# GOVERNED_RELEASE_ARCHITECTURE_DECISION.md). These pin the SECURE behavior the
+# governance owner requires but that CANNOT be provided while the board is a
+# same-user-writable SQLite file with no service/OS boundary. They are xfail
+# (strict) so they are honest RED markers, NOT fake-green security tests: they
+# will start XPASS (and must be un-xfailed) only when a real boundary
+# (Option A/B in the memo) removes the bypass.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(strict=True, reason="BLOCKED-ARCHITECTURE: board DB is same-user writable; "
+                   "raw sqlite3 write bypasses all app authority. See "
+                   "GOVERNED_RELEASE_ARCHITECTURE_DECISION.md")
+def test_raw_db_write_cannot_grant_execution_authority(kanban_home):
+    """SECURE expectation: nothing outside an authorized release may set
+    execution_authorized=1. Reality on this SHA: a raw sqlite3 UPDATE to the
+    board file does exactly that, with no release and no identity — proving the
+    authority gate is not a security boundary. Fails (xpasses) only when board
+    writes are isolated behind a trusted service/ACL."""
+    import sqlite3
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="raw-write victim", governed=True, assignee="relay")
+    dbpath = kb.kanban_db_path()
+    raw = sqlite3.connect(str(dbpath))
+    raw.execute("UPDATE tasks SET execution_authorized=1, status='ready' WHERE id=?", (tid,))
+    raw.commit()
+    raw.close()
+    with kbc.connect() as conn:
+        row = conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
+    # SECURE assertion (currently violated -> xfail): raw write must NOT authorize.
+    assert row["execution_authorized"] == 0
+
+
+@pytest.mark.xfail(strict=True, reason="BLOCKED-ARCHITECTURE: get_active_profile_name derives "
+                   "identity from caller-settable HERMES_HOME; profile-home spoof forges the "
+                   "release authority. See GOVERNED_RELEASE_ARCHITECTURE_DECISION.md")
+def test_profile_home_spoof_cannot_release(tmp_path, monkeypatch):
+    """SECURE expectation: an ordinary caller cannot mint the 'hermes' release
+    authority by pointing HERMES_HOME at a .../profiles/hermes directory.
+    Reality on this SHA: get_active_profile_name() returns 'hermes' for any such
+    path, so release_task succeeds. Fails (xpasses) only when release identity is
+    server-owned, not env-derived."""
+    from hermes_cli import profiles
+    board_home = tmp_path / ".hermes"
+    board_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(board_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="spoof victim", governed=True, assignee="relay")
+    # Spoof: any caller can name a profiles/hermes home.
+    spoof_home = tmp_path / "attacker" / ".hermes" / "profiles" / "hermes"
+    spoof_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(spoof_home))
+    import importlib
+    importlib.reload(importlib.import_module("hermes_constants"))
+    forged = profiles.get_active_profile_name()
+    monkeypatch.setenv("HERMES_HOME", str(board_home))
+    importlib.reload(importlib.import_module("hermes_constants"))
+    with kbc.connect() as conn:
+        ok, _ = kb.release_task(conn, tid, actor="x", reason="spoof", caller_identity=forged)
+    # SECURE assertion (currently violated -> xfail): a spoofed identity must not release.
+    assert not ok
+

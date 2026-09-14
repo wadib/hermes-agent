@@ -29,14 +29,21 @@ Re-review: PENDING — Sentinel under a new review slip after this handoff.
   orchestrator_profile, widenable via `kanban.governed_release_authorities`);
   caller-supplied `actor` is audit provenance only and confers no authority.
 
-## Authority model / trust boundary (honest limitation)
-Release authority is a durable config policy checked against the caller identity
-resolved by the trusted ingress (CLI active profile; gateway/Desktop trusted
-session identity). This enforces "only configured release-authority profiles may
-release" and rejects normal profiles and delegated children at the DB boundary.
-It is NOT cryptographic: on a local single-user install, profile identity is
-process/HERMES_HOME-derived, so a local user who can set HERMES_HOME/env is
-outside this control's threat model. No claim of cryptographic security is made.
+## Authority model / trust boundary (BLOCKED-ARCHITECTURE — see GOVERNED_RELEASE_ARCHITECTURE_DECISION.md)
+Slip #006 finding: the release control is NOT a security boundary. The board is
+a same-user-writable SQLite file with no service/OS isolation, so (1) a raw
+`sqlite3` write sets execution_authorized=1 bypassing all app logic, and (2)
+`get_active_profile_name()` derives identity from caller-settable HERMES_HOME, so
+a profile-home spoof forges the 'hermes' release authority. Both bypasses are
+reproduced by strict-xfail tests in tests/hermes_cli/test_kanban_governed_mode.py.
+An unforgeable release CANNOT be built in-process under this threat model.
+Governed release/complete state guards from Slip #004 remain effective ONLY as
+operational/audit controls against non-adversarial mistakes — they must NOT be
+relied on as security. Do NOT enable governed mode on any board as a security
+feature until a real boundary (memo Option A service-owned DB/ACL, or Option B)
+ships, or Wessam explicitly accepts the same-user impersonation residual (Option
+C). The internal-acceptance liveness route is intentionally NOT implemented yet
+because it would inherit the forgeable authority.
 
 ## Proof no restart occurred during this slip
 - No `hermes desktop --force-build`, `npm run build`, PM2 action, gateway
