@@ -309,6 +309,13 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
+    # Slip #002: governed work is never auto-decomposed or LLM-reassigned, even
+    # via a direct decompose call — defense at the mutation, not just the lister.
+    if getattr(task, "governed", False):
+        return DecomposeOutcome(
+            task_id, False, "task is governed; governed work is not auto-decomposed",
+        )
+
     routing = _load_routing()
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
@@ -333,10 +340,15 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Slip #002: governed triage tasks are excluded — governed Council/Command
+    work is never auto-decomposed or LLM-reassigned; it waits for an explicit
+    authorized transition.
+    """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+    return [row.id for row in rows if not getattr(row, "governed", False)]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

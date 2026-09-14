@@ -191,6 +191,12 @@ _SPECS = [
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--delivery-required", action="store_true",
              help="Require artifact and user-message receipt before this task is represented as delivered."),
+        _arg("--governed", action="store_true",
+             help="Slip #002 governed mode: fail-closed Council/Command task. Starts execution-unauthorized "
+                  "(needs `kanban release`), never auto-promoted/decomposed/reassigned, review needs a distinct reviewer."),
+        _arg("--acceptance-owner", metavar="OWNER", dest="acceptance_owner",
+             help="Named acceptance owner for governed delivery-required work (default 'hermes'; set to the "
+                  "sensitive-work owner for public/financial/security-sensitive cards)."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -334,6 +340,10 @@ _SPECS = [
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+    _cmd("release", [
+        _TASK_ID,
+        _arg("reason", nargs="*", help="Audit-trail reason (recorded on the released event)"),
+    ], help="Slip #002: grant a governed task execution authority (fail-closed release before it can run)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",

@@ -733,6 +733,11 @@ class Task:
     # A task that must produce a user-facing delivery receipt before it can be
     # represented as delivered. False preserves legacy/local-task semantics.
     delivery_required: bool = False
+    # Slip #002 governed mode: fail-closed Council/Command work. False keeps the
+    # legacy (non-governed) lifecycle unchanged.
+    governed: bool = False
+    # Named acceptance owner for governed delivery-required work; None = legacy.
+    acceptance_owner: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -751,6 +756,7 @@ class Task:
             goal_mode=bool(g("goal_mode")),
             execution_authorized=bool(g("execution_authorized", 1)),
             delivery_required=bool(g("delivery_required")),
+            governed=bool(g("governed")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
 
@@ -764,7 +770,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "acceptance_owner",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1039,7 +1045,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Separate from final acceptance: records whether the work itself is
     -- authorized to execute. A delivery-required task can be authorized and
     -- running while still incapable of transitioning to Done.
-    execution_authorized INTEGER NOT NULL DEFAULT 1
+    execution_authorized INTEGER NOT NULL DEFAULT 1,
+    -- Slip #002 governed mode (opt-in, Council/Command work). A governed task
+    -- is fail-closed: created execution_authorized=0, never auto-promoted,
+    -- auto-decomposed, auto-reassigned, or auto-review-dispatched. Legacy rows
+    -- default 0 and keep their exact pre-governed behavior.
+    governed             INTEGER NOT NULL DEFAULT 0,
+    -- Named acceptance owner for governed delivery-required work. Default
+    -- 'hermes' for internal technical work; set to the sensitive-work owner
+    -- (e.g. 'wessam') when the card is public/financial/security-sensitive.
+    -- NULL for non-governed tasks (legacy acceptance paths unchanged).
+    acceptance_owner     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1397,6 +1413,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None, delivery_required: bool = False,
     execution_authorized: bool = True,
+    governed: Optional[bool] = None, acceptance_owner: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1451,6 +1468,29 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
+    # Slip #002 governed mode (opt-in). Explicit governed= wins; otherwise a
+    # board flagged ``governed: true`` makes its new tasks governed by default.
+    # Legacy boards have no key -> non-governed -> byte-identical legacy path.
+    if governed is None:
+        try:
+            governed = bool(_board_meta_for(board).get("governed", False))
+        except Exception:
+            governed = False
+    governed = bool(governed)
+    if governed:
+        # Fail-closed: a governed task cannot run until an explicit release_task.
+        # Parent completion alone must never grant execution authority.
+        execution_authorized = False
+        # Conversation-originated governed work must bind a durable delivery
+        # receipt before it can be represented as delivered/Done.
+        if session_id or creator_task_id:
+            delivery_required = True
+        # Internal governed work defaults to Hermes as the named acceptance
+        # owner; callers name a different owner for sensitive/approval-bound work.
+        if not (acceptance_owner or "").strip():
+            acceptance_owner = "hermes"
+    acceptance_owner = (acceptance_owner or "").strip() or None
+
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
@@ -1479,6 +1519,13 @@ def create_task(
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                # Slip #002: a governed, unreleased task must never be created in
+                # a dispatchable phase (``ready``/``running``) — it would spin the
+                # dispatcher on a claim-reject loop. Park it in ``todo`` (triage /
+                # explicit ``blocked`` holds are preserved); ``release_task`` +
+                # ``recompute_ready`` promote it to ``ready`` when appropriate.
+                if governed and not execution_authorized and task_status in ("ready", "running"):
+                    task_status = "todo"
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1497,8 +1544,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract, delivery_required,
-                        execution_authorized
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        execution_authorized, governed, acceptance_owner
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1509,6 +1556,7 @@ def create_task(
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                         1 if delivery_required else 0, 1 if execution_authorized else 0,
+                        1 if governed else 0, acceptance_owner,
                     ),
                 )
                 for pid in parents:
@@ -1532,6 +1580,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "execution_authorized": bool(execution_authorized),
+                        "governed": bool(governed) or None,
                     },
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
@@ -2759,12 +2808,17 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, governed, execution_authorized "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            # Slip #002: a governed task is fail-closed — parent completion alone
+            # never promotes it. Only an explicit release_task (which sets
+            # execution_authorized=1) makes a governed task eligible for ready.
+            if _row_get(row, "governed") and not _row_get(row, "execution_authorized"):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -3786,7 +3840,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, governed "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3814,6 +3868,20 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        # Slip #002: a governed review must have a reviewer distinct from the
+        # implementer — no self-review, and no same-profile auto-redispatch.
+        if _row_get(trow, "governed"):
+            impl_c = _canonical_assignee(implementer)
+            if reviewer is None or not str(reviewer).strip():
+                return _ret(
+                    False, "governed review requires an explicit reviewer profile "
+                    "distinct from the implementer",
+                )
+            if impl_c is not None and reviewer == impl_c:
+                return _ret(
+                    False, "governed review reviewer must differ from the "
+                    f"implementer ({impl_c!r})",
+                )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3945,6 +4013,41 @@ def request_changes(
     return True, implementer
 
 
+def release_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Slip #002 explicit release: grant a governed task execution authority.
+
+    A governed task is created ``execution_authorized=0`` and cannot claim/run
+    or auto-promote until this durable action fires. Writes an auditable
+    ``released`` event and, when parents are satisfied, promotes it to its
+    resumable phase via ``recompute_ready``. Returns ``(ok, reason)``.
+
+    Refused for a non-governed task (there is nothing to release) and idempotent
+    on an already-released task.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, f"task {task_id} not found"
+    if not task.governed:
+        return False, f"task {task_id} is not governed; release does not apply"
+    if task.execution_authorized:
+        return True, None  # already released — idempotent
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET execution_authorized = 1 "
+            "WHERE id = ? AND governed = 1 AND execution_authorized = 0",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} release lost a race (status changed)"
+        _append_event(conn, task_id, "released", {"actor": actor, "reason": reason})
+    # Outside the txn (own IMMEDIATE txn): a released, parent-satisfied task
+    # flips to ready now instead of idling until the next tick.
+    recompute_ready(conn)
+    return True, None
+
+
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     dry_run: bool = False,
@@ -3960,6 +4063,17 @@ def promote_task(
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
+        )
+
+    # Slip #002: a governed task is fail-closed. Promotion cannot substitute for
+    # the durable explicit release — use ``release_task`` (which grants execution
+    # authority via an auditable ``released`` event), then promotion/recompute
+    # can proceed.
+    grow = get_task(conn, task_id)
+    if grow is not None and grow.governed and not grow.execution_authorized:
+        return False, (
+            f"task {task_id} is governed and not released; run an explicit "
+            f"release before promotion (governed work never auto-promotes)"
         )
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever

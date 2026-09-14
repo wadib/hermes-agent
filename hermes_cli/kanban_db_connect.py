@@ -815,6 +815,11 @@ _LATER_TASK_COLUMNS = (
     # Historical cards were already created under the pre-existing execution
     # lifecycle, so migration preserves their runnable authority.
     ("execution_authorized", "execution_authorized INTEGER NOT NULL DEFAULT 1"),
+    # Slip #002 governed mode. Existing rows default 0 (non-governed) so their
+    # promotion/decompose/review/acceptance behavior is unchanged.
+    ("governed", "governed INTEGER NOT NULL DEFAULT 0"),
+    # Named acceptance owner for governed delivery-required work; NULL legacy.
+    ("acceptance_owner", "acceptance_owner TEXT"),
     ("session_id", "session_id TEXT"),
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),

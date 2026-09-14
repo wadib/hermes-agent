@@ -1717,11 +1717,20 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
-def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+def _lane_rows(conn: sqlite3.Connection, status: str, *, exclude_governed: bool = False) -> list[sqlite3.Row]:
+    """Unclaimed rows of one lane in dispatch order.
+
+    ``exclude_governed`` (Slip #002): the review lane never auto-dispatches a
+    governed task — a governed review is held for an explicit, distinct reviewer
+    assignment, so a reclaimed/crashed governed review can never auto-respawn a
+    same-profile reviewer. The ready lane is NOT filtered: a governed task only
+    reaches ready after an explicit release, at which point it dispatches
+    normally.
+    """
+    governed_clause = " AND governed = 0" if exclude_governed else ""
     return conn.execute(
         "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
+        f"WHERE status = '{status}' AND claim_lock IS NULL{governed_clause} "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
 
@@ -1790,7 +1799,7 @@ def _dispatch_once_locked(
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = _lane_rows(conn, "review", exclude_governed=True) if review_dispatch_enabled() else []
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
