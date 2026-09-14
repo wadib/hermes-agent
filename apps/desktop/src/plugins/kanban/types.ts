@@ -247,6 +247,7 @@ export const COLUMN_META: Record<string, { codicon: string; tone: string }> = {
   running: { codicon: 'sync', tone: '#34d399' },
   blocked: { codicon: 'error', tone: '#f87171' },
   review: { codicon: 'eye', tone: '#fbbf24' },
+  approved: { codicon: 'check', tone: '#4ade80' },
   delivery_pending: { codicon: 'package', tone: '#f97316' },
   awaiting_acceptance: { codicon: 'pass-filled', tone: '#38bdf8' },
   done: { codicon: 'pass', tone: 'var(--ui-text-tertiary)' },
