@@ -214,7 +214,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "release", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "promote", "release", "accept-internal", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1075,6 +1075,30 @@ def _cmd_release(args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_accept_internal(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    author = _profile_author()
+    # Slip #010: finalizing an internal (no-session) governed task is a board-owner
+    # operational decision, same role gate as release. A non-owner cannot accept.
+    from hermes_cli import kanban_authority
+    if not kanban_authority.is_board_authority_owner():
+        print(f"cannot accept {tid}: internal governed acceptance is reserved to the "
+              f"trusted board-owner (default Hermes) context", file=sys.stderr)
+        return 1
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        # Default the accepting owner to the task's named acceptance_owner.
+        owner = (getattr(args, "accepting_owner", None) or
+                 (task.acceptance_owner if task else None) or author)
+        ok = kb.accept_internal_governed_delivery(conn, tid, accepting_owner=owner, authorized=True)
+    if ok:
+        print(f"Accepted {tid} (internal governed delivery finalized by {owner!r}); task done.")
+        return 0
+    print(f"cannot accept {tid}: not an internal governed task in delivery_pending, "
+          f"owner mismatch, or already accepted", file=sys.stderr)
+    return 1
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1278,6 +1302,7 @@ _HANDLERS = {
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "release": _cmd_release,
+    "accept-internal": _cmd_accept_internal,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

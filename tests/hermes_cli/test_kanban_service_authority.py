@@ -179,3 +179,39 @@ def test_cli_board_owner_release_executes(kanban_home, monkeypatch):
     assert "released" in rel.lower(), rel
     with kbc.connect() as conn:
         assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 1
+
+
+def test_cli_accept_internal_board_owner_finalizes_and_non_owner_denied(kanban_home, monkeypatch):
+    """The `accept-internal` CLI surface finalizes an internal (no-session)
+    governed task from delivery_pending to done — board-owner only. A non-owner
+    is denied and the task stays delivery_pending (invariant 5: internal work has
+    a usable durable acceptance and does not deadlock)."""
+    from hermes_cli import kanban as kc
+    import json
+    monkeypatch.setattr(ka, "is_board_authority_owner", lambda home=None: True)
+    out = kc.run_slash("create 'internal gov cli' --assignee relay --governed --json")
+    tid = json.loads(out)["id"]
+    # Drive to delivery_pending as the board-owner.
+    assert "released" in kc.run_slash(f"release {tid} go").lower()
+    with kbc.connect() as conn:
+        kb.claim_task(conn, tid)
+        kb.add_attachment(conn, tid, filename="r.md", stored_path="/tmp/r.md", size=2)
+        assert kb.complete_task(conn, tid, summary="done")
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "delivery_pending"
+
+    # Non-owner cannot accept-internal.
+    monkeypatch.setattr(ka, "is_board_authority_owner", lambda home=None: False)
+    denied = kc.run_slash(f"accept-internal {tid}")
+    assert "cannot accept" in denied.lower(), denied
+    with kbc.connect() as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "delivery_pending"
+
+    # Board-owner finalizes to done via the CLI surface.
+    monkeypatch.setattr(ka, "is_board_authority_owner", lambda home=None: True)
+    accepted = kc.run_slash(f"accept-internal {tid}")
+    assert "accepted" in accepted.lower(), accepted
+    with kbc.connect() as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "done"
+        assert kb.get_task_acceptance(conn, tid) is not None
+    # A delegated child may not invoke this authority action.
+    assert "accept-internal" in kc._DELEGATED_CHILD_DENIED_ACTIONS

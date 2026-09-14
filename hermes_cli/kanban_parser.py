@@ -344,6 +344,11 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the released event)"),
     ], help="Slip #002: grant a governed task execution authority (fail-closed release before it can run)"),
+    _cmd("accept-internal", [
+        _TASK_ID,
+        _arg("--accepting-owner", dest="accepting_owner", default=None,
+             help="Named acceptance owner finalizing this internal governed task (defaults to the task's acceptance_owner)"),
+    ], help="Slip #010: board-owner finalizes an internal (no-session) governed task from delivery_pending to done"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",

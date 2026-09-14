@@ -38,6 +38,10 @@ gap, and no security is claimed against it.
 - CLI `release`: board-owner releases directly; a non-owner submits a durable,
   NON-AUTHORITATIVE request (`submit_release_request` -> `release_requested`
   event) that never changes state and cannot auto-approve.
+- CLI `accept-internal <id>`: board-owner-only surface that finalizes an internal
+  (no-session) governed task from delivery_pending to done via
+  `accept_internal_governed_delivery` (invariant 5 — internal governed work has a
+  real, invocable durable acceptance path and does not deadlock).
 - gateway/run.py: removed the capability mint at control-socket start (nothing to
   mint). The Slip #008 confused-deputy fix stands — NO privileged release/accept
   verb is exposed on the generic control socket.
