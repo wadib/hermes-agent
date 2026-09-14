@@ -131,17 +131,95 @@ def test_internal_acceptance_rejects_conversation_origin(kanban_home):
         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"] == "delivery_pending"
 
 
-# --- CLI-as-client fails closed with no service ----------------------------
+# --- Slip #009: confused-deputy verbs removed from the control socket -------
 
-def test_cli_release_fails_closed_when_no_service_reachable(kanban_home):
-    """The CLI holds no capability and no gateway answers the control socket, so
-    `release` fails closed (never falls back to identity)."""
-    from hermes_cli import kanban as kc
-    ka._reset_for_tests()
+def test_control_socket_rejects_removed_privileged_verbs(kanban_home):
+    """Slip #008 confused-deputy fix: the generic gateway control socket must NOT
+    expose governed-release / governed-accept-internal. A raw JSON request for
+    either is rejected as an unknown verb with ZERO mutation (no release, no
+    acceptance row) — even when the board-owner capability exists in this
+    process."""
     import json
+    from gateway.control_socket import GatewayControlServer
+    # Even with a minted capability present, the socket must not spend it.
+    ka.mint_service_capability()
+    server = GatewayControlServer(verb_handlers={})  # same shape as gateway now uses
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deputy victim", governed=True, assignee="relay")
+
+    for verb, extra in (("governed-release", {}),
+                        ("governed-accept-internal", {"accepting_owner": "hermes"})):
+        raw = json.dumps({"verb": verb, "id": 1, "task_id": tid, **extra}).encode("utf-8")
+        resp = json.loads(server.handle_request_line(raw).decode("utf-8"))
+        assert resp["ok"] is False, resp
+        assert "unknown verb" in resp["error"].lower(), resp
+
+    # Zero mutation: still unreleased, no acceptance row, not done.
+    with kbc.connect() as conn:
+        row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert dict(row) == {"status": "todo", "execution_authorized": 0}
+        assert kb.get_task_acceptance(conn, tid) is None
+    ka._reset_for_tests()
+
+
+def test_submit_release_request_is_non_authoritative(kanban_home):
+    """A durable release request records provenance only and never authorizes."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="req only", governed=True, assignee="relay")
+        ok, _ = kb.submit_release_request(conn, tid, requested_by="relay", reason="please")
+        assert ok
+        row = conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["execution_authorized"] == 0
+        kinds = [e["kind"] for e in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert "release_requested" in kinds and "released" not in kinds
+
+
+def test_should_mint_board_authority_only_for_default_home(kanban_home, tmp_path, monkeypatch):
+    """Single-owner: only the default-home process is the board-authority owner;
+    a secondary-profile home is NOT (so it never mints/holds authority)."""
+    from hermes_cli import profiles
+    # kanban_home fixture set HERMES_HOME to the default home -> owner.
+    assert ka.should_mint_board_authority() is True
+    # A profile home under profiles/<name> is not the default -> not owner.
+    prof_home = tmp_path / ".hermes" / "profiles" / "relay"
+    prof_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(prof_home))
+    import importlib
+    importlib.reload(importlib.import_module("hermes_constants"))
+    assert ka.should_mint_board_authority() is False
+
+def test_cli_non_owner_release_is_request_only_never_executes(kanban_home, monkeypatch):
+    """Slip #009: a non board-owner CLI cannot execute release. It submits a
+    durable NON-AUTHORITATIVE request (release_requested event) and the task
+    stays unreleased — never auto-approves."""
+    from hermes_cli import kanban as kc
+    import json
+    ka._reset_for_tests()
+    # Force non-owner role regardless of the isolated-home path coincidence.
+    monkeypatch.setattr(ka, "should_mint_board_authority", lambda home=None: False)
+    monkeypatch.setattr("hermes_cli.kanban_authority.in_process_capability", lambda: None)
     out = kc.run_slash("create 'gov' --assignee relay --governed --json")
     tid = json.loads(out)["id"]
     rel = kc.run_slash(f"release {tid} attempt")
-    assert "cannot release" in rel.lower(), rel
+    assert "requested" in rel.lower(), rel
     with kbc.connect() as conn:
         assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 0
+        kinds = [e["kind"] for e in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+    assert "release_requested" in kinds
+    assert "released" not in kinds
+
+
+def test_cli_board_owner_release_executes(kanban_home, monkeypatch):
+    """When THIS process is the board-authority owner (holds the in-process
+    capability), the CLI release executes directly."""
+    from hermes_cli import kanban as kc
+    import json
+    cap = ka.mint_service_capability()  # become the owner (in-process capability)
+    monkeypatch.setattr("hermes_cli.kanban_authority.in_process_capability", lambda: cap)
+    out = kc.run_slash("create 'gov owner' --assignee relay --governed --json")
+    tid = json.loads(out)["id"]
+    rel = kc.run_slash(f"release {tid} go")
+    assert "released" in rel.lower(), rel
+    with kbc.connect() as conn:
+        assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 1
+    ka._reset_for_tests()

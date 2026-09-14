@@ -4236,6 +4236,35 @@ def request_changes(
     return True, implementer
 
 
+def submit_release_request(
+    conn: sqlite3.Connection, task_id: str, *, requested_by: str, reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Slip #009: a durable, NON-AUTHORITATIVE release request from an ordinary
+    caller (a non board-owner CLI/agent). It records a ``release_requested``
+    event as audit/request data ONLY and NEVER changes ``execution_authorized``
+    or status — it cannot auto-approve. The single board-authority owner
+    resolves the request separately (via the server-internal capability path),
+    re-deciding task, release, and acceptance owner from persisted policy;
+    ``requested_by`` is request provenance, not authority.
+
+    Returns ``(ok, message)``. Refused for a non-governed task (nothing to
+    release) or an already-released one (nothing to request).
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, f"task {task_id} not found"
+    if not task.governed:
+        return False, f"task {task_id} is not governed; release does not apply"
+    if task.execution_authorized:
+        return True, "already released"
+    with write_txn(conn):
+        _append_event(conn, task_id, "release_requested", {
+            "requested_by": requested_by, "reason": reason,
+            "note": "non-authoritative request; awaits board-authority owner",
+        })
+    return True, None
+
+
 def release_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     caller_identity: Optional[str] = None, capability: Optional[str] = None,

@@ -210,17 +210,7 @@ class GatewayControlServer:
                 response: dict[str, Any] = {"ok": False, "error": f"unknown verb: {verb!r}",
                                             "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
             else:
-                # Backward compatible: zero-arg handlers (identify/status) are
-                # called with no args; a handler that declares a parameter
-                # receives the parsed request dict (governed-release/accept need
-                # task_id etc.). Never pass the raw socket — only the JSON body.
-                try:
-                    import inspect
-                    takes_request = len(inspect.signature(handler).parameters) >= 1
-                except (TypeError, ValueError):
-                    takes_request = False
-                result = handler(request) if takes_request else handler()
-                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": result}
+                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler()}
         except Exception as exc:
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
         if request_id is not None:
@@ -350,23 +340,3 @@ def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIM
     Step 2 of the socket migration (#92091).
     """
     return query_gateway_control(home, "pause-for-update", timeout=timeout)
-
-
-def call_gateway_control(home: Path, verb: str, params: dict[str, Any], *,
-                         timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
-    """Send a control verb WITH params to the gateway serving ``home``; returns its
-    ``result`` payload or None on any failure (no/stale socket, timeout, ``ok:false``).
-
-    Used by the CLI governed-release/accept client (Slip #007): the CLI never holds
-    the service capability — it asks the trusted gateway, which does. A None return
-    means the caller fails closed (no gateway => no release)."""
-    body = {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION, **params}
-    request = json.dumps(body).encode("utf-8") + b"\n"
-    query = _query_windows_pipe if _IS_WINDOWS else _query_unix_socket
-    try:
-        raw = query(Path(home), request, timeout)
-        response = json.loads(raw.decode("utf-8")) if raw else None
-    except Exception:
-        return None
-    result = response.get("result") if isinstance(response, dict) and response.get("ok") is True else None
-    return result if isinstance(result, dict) else None

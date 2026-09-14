@@ -122,3 +122,33 @@ def _reset_for_tests() -> None:
     """Test-only: clear the in-process capability marker."""
     global _IN_PROCESS_CAPABILITY
     _IN_PROCESS_CAPABILITY = None
+
+
+# ---------------------------------------------------------------------------
+# Slip #009 — single board-authority owner + honest UNKNOWN boundary
+# ---------------------------------------------------------------------------
+
+def should_mint_board_authority(home: Optional[Path] = None) -> bool:
+    """Whether THIS process is the single designated board-authority owner that
+    may mint/hold the release capability.
+
+    Slip #008/#009: the Slip #007 mistake was minting in EVERY profile gateway,
+    so any gateway became a confused deputy. Authority belongs to ONE owner: the
+    board-owning (default-Hermes) service for the shared board home. Ownership is
+    the process whose HERMES_HOME is the DEFAULT home (the shared board lives
+    under the default tree; secondary profiles must NOT mint).
+
+    HONEST LIMIT (OPS #007-OPS): on a single-user box with no separate service
+    identity/ACL, "owner" is a process-role convention, NOT an OS-enforced
+    identity — a hostile same-user process could still set HERMES_HOME to the
+    default and mint. This function decides ROLE, not security; the real
+    boundary arrives only with the separate Windows service account + ACL.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.profiles import _get_default_hermes_home
+        resolved = get_hermes_home().resolve()
+        default = _get_default_hermes_home().resolve()
+        return resolved == default
+    except Exception:
+        return False

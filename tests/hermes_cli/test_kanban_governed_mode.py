@@ -236,21 +236,25 @@ def test_cli_governed_create_and_release_round_trip(kanban_home):
         assert "released" in evs
 
 
-def test_cli_governed_release_fails_closed_without_service(kanban_home):
-    """Slip #007: a bare CLI (no in-process capability, no reachable board
-    service) cannot release — it fails closed and the task stays unreleased.
-    Profile identity/HERMES_HOME no longer authorizes anything."""
+def test_cli_governed_release_non_owner_is_request_only(kanban_home, monkeypatch):
+    """Slip #009: a non board-owner CLI cannot execute release; it submits a
+    durable NON-AUTHORITATIVE request and the task stays unreleased. Profile
+    identity/HERMES_HOME authorizes nothing."""
     from hermes_cli import kanban as kc
     from hermes_cli import kanban_authority
 
-    kanban_authority._reset_for_tests()  # ensure this process holds no capability
+    kanban_authority._reset_for_tests()  # this process holds no capability
+    monkeypatch.setattr(kanban_authority, "should_mint_board_authority", lambda home=None: False)
+    monkeypatch.setattr("hermes_cli.kanban_authority.in_process_capability", lambda: None)
     out = kc.run_slash("create 'gov cli unauth' --assignee alice --governed --json")
     tid = json.loads(out)["id"]
     rel = kc.run_slash(f"release {tid} attempt")
-    assert "cannot release" in rel.lower(), rel
+    assert "requested" in rel.lower(), rel
     with kbc.connect() as conn:
         row = conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
         assert row["execution_authorized"] == 0
+        kinds = [e["kind"] for e in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert "release_requested" in kinds and "released" not in kinds
 
 
 # ---------------------------------------------------------------------------

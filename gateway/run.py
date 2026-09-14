@@ -5026,63 +5026,30 @@ def _start_gateway_claim_pid_file() -> bool:
     return True
 
 
-def _governed_release_handler(request: dict) -> dict:
-    """control-socket verb 'governed-release' — Slip #007. Runs IN the trusted
-    gateway process, which minted the service capability at boot, so it can
-    authorize a governed release that an ordinary CLI/agent client cannot. The
-    client passes only task_id/reason/actor; authority is the in-process
-    capability, never anything the client sends."""
-    from hermes_cli import kanban_authority
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    task_id = str(request.get("task_id") or "").strip()
-    if not task_id:
-        return {"ok": False, "error": "task_id required"}
-    reason = request.get("reason")
-    actor = str(request.get("actor") or "gateway-service")
-    cap = kanban_authority.in_process_capability()
-    if not cap:
-        return {"ok": False, "error": "gateway holds no service capability"}
-    board = request.get("board") or None
-    with kbc.connect_closing(board=board) as conn:
-        ok, err = kb.release_task(conn, task_id, actor=actor, reason=reason,
-                                  caller_identity=f"gateway:{os.getpid()}", capability=cap)
-    return {"ok": bool(ok), "error": err, "task_id": task_id}
-
-
-def _governed_accept_internal_handler(request: dict) -> dict:
-    """control-socket verb 'governed-accept-internal' — Slip #007. The trusted
-    gateway finalizes an internal (no-session) governed task on behalf of its
-    named acceptance owner, using the in-process capability."""
-    from hermes_cli import kanban_authority
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    task_id = str(request.get("task_id") or "").strip()
-    accepting_owner = str(request.get("accepting_owner") or "").strip()
-    if not task_id or not accepting_owner:
-        return {"ok": False, "error": "task_id and accepting_owner required"}
-    cap = kanban_authority.in_process_capability()
-    if not cap:
-        return {"ok": False, "error": "gateway holds no service capability"}
-    board = request.get("board") or None
-    with kbc.connect_closing(board=board) as conn:
-        ok = kb.accept_internal_governed_delivery(conn, task_id, accepting_owner=accepting_owner, capability=cap)
-    return {"ok": bool(ok), "task_id": task_id}
+def _start_gateway_start_control_socket_verbs():
+    """Slip #009: the generic control socket exposes ONLY non-privileged verbs
+    (identify/status/pause-for-update). Governed release + internal acceptance
+    are server-internal (kanban_db + kanban_authority), never reachable as a
+    local socket verb — removing the Slip #007 confused-deputy surface."""
+    return {}
 
 
 async def _start_gateway_start_control_socket(runner):
     """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
     import atexit
     _control_server = None
-    # Slip #007: mint the board-service release capability now that this process
-    # is the authoritative gateway for its HERMES_HOME. Held in-process; the
-    # governed-release/accept verbs use it. Non-fatal on failure (release then
-    # simply has no authority source — fail closed).
+    # Slip #009: mint the board-service release capability ONLY in the single
+    # designated board-owner context (never every profile gateway — that was the
+    # Slip #007 over-mint). kanban_authority decides ownership; a non-owner
+    # gateway holds no authority and can neither release nor accept. The
+    # confused-deputy verbs are REMOVED from this socket entirely (Slip #008):
+    # privileged release/accept is server-internal only, never a local verb.
     try:
         from hermes_cli import kanban_authority
-        kanban_authority.mint_service_capability()
+        if kanban_authority.should_mint_board_authority():
+            kanban_authority.mint_service_capability()
     except Exception as _cap_exc:
-        logger.debug("Governed service capability mint failed (non-fatal): %s", _cap_exc)
+        logger.debug("Governed board authority mint skipped/failed (non-fatal): %s", _cap_exc)
     try:
         # Started immediately after the PID-file claim: winning that O_EXCL race is the moment this process
         # becomes the authoritative gateway for its HERMES_HOME, so from here on "does a socket answer?" is
@@ -5121,9 +5088,7 @@ async def _start_gateway_start_control_socket(runner):
                 "pid": os.getpid(), "drain_timeout": _drain}
 
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler,
-                           "governed-release": _governed_release_handler,
-                           "governed-accept-internal": _governed_accept_internal_handler})
+            verb_handlers={"pause-for-update": _pause_for_update_handler})
         if not await _control_server.start():
             _control_server = None
         else:

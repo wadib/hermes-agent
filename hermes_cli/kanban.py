@@ -1047,32 +1047,32 @@ def _cmd_release(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     tid = args.task_id
-    # Slip #007: authority is the trusted board-service CAPABILITY, never the
-    # caller's profile identity (forgeable via HERMES_HOME — Slip #005/#006). If
-    # THIS process minted the capability (it is the service), release directly.
-    # Otherwise act as a client: ask the gateway (which holds the capability) to
-    # perform the release. No reachable gateway => fail closed (no release).
+    # Slip #009: authority is the server-INTERNAL capability held ONLY by the
+    # single board-authority owner (default-Hermes board service). There is NO
+    # local socket verb to ask a deputy (that was the Slip #008 confused deputy).
+    # - If THIS process IS the board-authority owner (holds the in-process
+    #   capability), release directly.
+    # - Otherwise submit a durable, NON-AUTHORITATIVE request and report pending.
+    #   A request never auto-approves; the owner resolves it separately.
     from hermes_cli import kanban_authority
-    from hermes_constants import get_hermes_home
     cap = kanban_authority.in_process_capability()
     if cap:
         with kbc.connect_closing() as conn:
             ok, err = kb.release_task(conn, tid, actor=author, reason=reason,
-                                      caller_identity=f"service:{author}", capability=cap)
-    else:
-        from gateway.control_socket import call_gateway_control
-        res = call_gateway_control(get_hermes_home(), "governed-release",
-                                   {"task_id": tid, "reason": reason, "actor": author})
-        if res is None:
-            print(f"cannot release {tid}: no trusted board service is reachable "
-                  f"(governed release is service-owned; Slip #007)", file=sys.stderr)
-            return 1
-        ok, err = bool(res.get("ok")), res.get("error")
+                                      caller_identity=f"board-owner:{author}", capability=cap)
+        if ok:
+            suffix = f": {reason}" if reason else ""
+            print(f"Released {tid} (execution authorized){suffix}")
+            return 0
+        print(f"cannot release {tid}: {err}", file=sys.stderr)
+        return 1
+    # Non-owner: durable request only, never executes.
+    with kbc.connect_closing() as conn:
+        ok, msg = kb.submit_release_request(conn, tid, requested_by=author, reason=reason)
     if ok:
-        suffix = f": {reason}" if reason else ""
-        print(f"Released {tid} (execution authorized){suffix}")
+        print(f"Release REQUESTED for {tid} (pending board-authority approval; not authorized).")
         return 0
-    print(f"cannot release {tid}: {err}", file=sys.stderr)
+    print(f"cannot request release for {tid}: {msg}", file=sys.stderr)
     return 1
 
 
