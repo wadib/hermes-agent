@@ -1336,16 +1336,13 @@ def test_governed_unreleased_task_dashboard_bulk_cannot_reach_ready(client):
 
 
 def test_governed_released_task_dashboard_can_reach_ready(client):
-    """A governed task that has been explicitly released by the trusted service
-    capability (Slip #007) moves to ready normally — the guard blocks only
+    """A governed task explicitly released by the trusted board-owner operational
+    decision (Slip #010) moves to ready normally — the guard blocks only
     UNRELEASED governed work, not legitimate flow."""
-    from hermes_cli import kanban_authority
     with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="governed released", governed=True, assignee="relay")
-        ok, reason = kb.release_task(conn, task_id, actor="default", reason="approved",
-                                     capability=kanban_authority.mint_service_capability())
+        ok, reason = kb.release_task(conn, task_id, actor="default", reason="approved", authorized=True)
         assert ok, reason
-    kanban_authority._reset_for_tests()
 
     ready = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "ready"})
     assert ready.status_code == 200, ready.text

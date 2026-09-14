@@ -5026,30 +5026,16 @@ def _start_gateway_claim_pid_file() -> bool:
     return True
 
 
-def _start_gateway_start_control_socket_verbs():
-    """Slip #009: the generic control socket exposes ONLY non-privileged verbs
-    (identify/status/pause-for-update). Governed release + internal acceptance
-    are server-internal (kanban_db + kanban_authority), never reachable as a
-    local socket verb — removing the Slip #007 confused-deputy surface."""
-    return {}
-
-
 async def _start_gateway_start_control_socket(runner):
     """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
     import atexit
     _control_server = None
-    # Slip #009: mint the board-service release capability ONLY in the single
-    # designated board-owner context (never every profile gateway — that was the
-    # Slip #007 over-mint). kanban_authority decides ownership; a non-owner
-    # gateway holds no authority and can neither release nor accept. The
-    # confused-deputy verbs are REMOVED from this socket entirely (Slip #008):
-    # privileged release/accept is server-internal only, never a local verb.
-    try:
-        from hermes_cli import kanban_authority
-        if kanban_authority.should_mint_board_authority():
-            kanban_authority.mint_service_capability()
-    except Exception as _cap_exc:
-        logger.debug("Governed board authority mint skipped/failed (non-fatal): %s", _cap_exc)
+    # Slip #010 (LOCAL OPERATIONAL): governed release/accept is an operational
+    # decision made in the trusted board-owner (default-Hermes) process via
+    # kanban_authority.is_board_authority_owner() — a process-ROLE check, not a
+    # secret capability. Nothing to mint here, and NO privileged release/accept
+    # verb is exposed on this generic control socket (Slip #008 confused-deputy
+    # fix stands).
     try:
         # Started immediately after the PID-file claim: winning that O_EXCL race is the moment this process
         # becomes the authoritative gateway for its HERMES_HOME, so from here on "does a socket answer?" is

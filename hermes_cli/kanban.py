@@ -1047,19 +1047,18 @@ def _cmd_release(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     tid = args.task_id
-    # Slip #009: authority is the server-INTERNAL capability held ONLY by the
-    # single board-authority owner (default-Hermes board service). There is NO
-    # local socket verb to ask a deputy (that was the Slip #008 confused deputy).
-    # - If THIS process IS the board-authority owner (holds the in-process
-    #   capability), release directly.
-    # - Otherwise submit a durable, NON-AUTHORITATIVE request and report pending.
-    #   A request never auto-approves; the owner resolves it separately.
+    # Slip #010 (LOCAL OPERATIONAL): governed release is an operational decision
+    # reserved to the trusted board-owner (default-Hermes) process role. If THIS
+    # process is the board-owner, release directly; otherwise submit a durable,
+    # NON-AUTHORITATIVE request (never auto-approves). Profile/actor are audit
+    # provenance only. This prevents accidental release from a non-owner app
+    # path; it is not a defense against a deliberate same-user process (out of
+    # scope on a trusted single-user machine).
     from hermes_cli import kanban_authority
-    cap = kanban_authority.in_process_capability()
-    if cap:
+    if kanban_authority.is_board_authority_owner():
         with kbc.connect_closing() as conn:
             ok, err = kb.release_task(conn, tid, actor=author, reason=reason,
-                                      caller_identity=f"board-owner:{author}", capability=cap)
+                                      caller_identity=f"board-owner:{author}", authorized=True)
         if ok:
             suffix = f": {reason}" if reason else ""
             print(f"Released {tid} (execution authorized){suffix}")
@@ -1070,7 +1069,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok, msg = kb.submit_release_request(conn, tid, requested_by=author, reason=reason)
     if ok:
-        print(f"Release REQUESTED for {tid} (pending board-authority approval; not authorized).")
+        print(f"Release REQUESTED for {tid} (pending board-owner approval; not authorized).")
         return 0
     print(f"cannot request release for {tid}: {msg}", file=sys.stderr)
     return 1

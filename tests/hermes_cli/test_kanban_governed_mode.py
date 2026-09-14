@@ -38,13 +38,11 @@ def _fake_spawn(*args, **kwargs):
     return 4242
 
 
-def _svc_cap():
-    """Slip #007: mint (or adopt) the trusted board-service capability for the
-    current HERMES_HOME and return it, so a test can perform a governed release
-    the way the service does. Authority is possession of this secret, NOT a
-    profile identity."""
-    from hermes_cli import kanban_authority
-    return kanban_authority.mint_service_capability()
+def _authorized():
+    """Slip #010: governed release/accept is authorized only by the trusted
+    board-owner operational decision. Tests pass authorized=True to act as that
+    owner; there is no secret capability under the local operational model."""
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +74,7 @@ def test_governed_task_not_promoted_or_claimable_until_release(kanban_home):
 
     # Explicit release is the only thing that grants readiness.
     with kbc.connect() as conn:
-        ok, reason = kb.release_task(conn, child, actor="hermes", reason="approved", capability=_svc_cap())
+        ok, reason = kb.release_task(conn, child, actor="hermes", reason="approved", authorized=_authorized())
         assert ok, reason
         kb.recompute_ready(conn)
         row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (child,)).fetchone()
@@ -126,7 +124,7 @@ def test_governed_review_requires_distinct_reviewer_and_holds(kanban_home):
     review is not auto-dispatched to a worker without explicit assignment."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="gov review", assignee="alice", governed=True)
-        kb.release_task(conn, tid, actor="hermes", reason="go", capability=_svc_cap())
+        kb.release_task(conn, tid, actor="hermes", reason="go", authorized=_authorized())
         kb.claim_task(conn, tid)  # ready -> running under alice
 
         # Same-profile reviewer must be refused.
@@ -160,7 +158,7 @@ def test_governed_conversation_task_cannot_complete_direct_to_done(kanban_home):
             conn, title="gov convo task", assignee="alice", governed=True,
             session_id="sess-abc",  # conversation origin
         )
-        kb.release_task(conn, tid, actor="hermes", reason="go", capability=_svc_cap())
+        kb.release_task(conn, tid, actor="hermes", reason="go", authorized=_authorized())
         kb.claim_task(conn, tid)
         # A delivery-required task needs a durable deliverable before it can
         # enter a pending state (nothing to prove delivered otherwise).
@@ -201,11 +199,10 @@ def test_nongoverned_legacy_behavior_unchanged(kanban_home):
 # ---------------------------------------------------------------------------
 
 
-def test_cli_governed_create_and_release_round_trip(kanban_home):
+def test_cli_governed_create_and_release_round_trip(kanban_home, monkeypatch):
     """The real CLI entry (run_slash) creates a governed, fail-closed task. Slip
-    #007: release authority is the trusted board-service CAPABILITY. When the
-    process holds the in-process capability (as the service does), the CLI
-    release path performs the release directly."""
+    #010: release is the trusted board-owner operational decision — acting as the
+    board-owner, the CLI release path performs the release directly."""
     from hermes_cli import kanban as kc
     from hermes_cli import kanban_authority
 
@@ -221,14 +218,10 @@ def test_cli_governed_create_and_release_round_trip(kanban_home):
     # A delegated child must not be able to self-release (authority action).
     assert "release" in kc._DELEGATED_CHILD_DENIED_ACTIONS
 
-    # Simulate the trusted service context: mint the in-process capability, as
-    # the gateway does at boot. Now the CLI release path releases directly.
-    kanban_authority.mint_service_capability()
-    try:
-        rel = kc.run_slash(f"release {tid} approved-by-hermes")
-        assert "Released" in rel, rel
-    finally:
-        kanban_authority._reset_for_tests()
+    # Act as the trusted board-owner (operational decision); the CLI releases.
+    monkeypatch.setattr(kanban_authority, "is_board_authority_owner", lambda home=None: True)
+    rel = kc.run_slash(f"release {tid} approved-by-hermes")
+    assert "Released" in rel, rel
     with kbc.connect() as conn:
         row = conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
         assert row["execution_authorized"] == 1
@@ -237,15 +230,13 @@ def test_cli_governed_create_and_release_round_trip(kanban_home):
 
 
 def test_cli_governed_release_non_owner_is_request_only(kanban_home, monkeypatch):
-    """Slip #009: a non board-owner CLI cannot execute release; it submits a
+    """Slip #010: a non board-owner CLI cannot execute release; it submits a
     durable NON-AUTHORITATIVE request and the task stays unreleased. Profile
     identity/HERMES_HOME authorizes nothing."""
     from hermes_cli import kanban as kc
     from hermes_cli import kanban_authority
 
-    kanban_authority._reset_for_tests()  # this process holds no capability
-    monkeypatch.setattr(kanban_authority, "should_mint_board_authority", lambda home=None: False)
-    monkeypatch.setattr("hermes_cli.kanban_authority.in_process_capability", lambda: None)
+    monkeypatch.setattr(kanban_authority, "is_board_authority_owner", lambda home=None: False)
     out = kc.run_slash("create 'gov cli unauth' --assignee alice --governed --json")
     tid = json.loads(out)["id"]
     rel = kc.run_slash(f"release {tid} attempt")
@@ -270,7 +261,7 @@ def _deliver_governed_task(conn, *, acceptance_owner):
         conn, title="gov deliver", assignee="alice", governed=True,
         session_id="sess-x", acceptance_owner=acceptance_owner,
     )
-    kb.release_task(conn, tid, actor="hermes", reason="go", capability=_svc_cap())
+    kb.release_task(conn, tid, actor="hermes", reason="go", authorized=_authorized())
     kb.claim_task(conn, tid)
     kb.add_attachment(conn, tid, filename="r.md", stored_path="/tmp/r.md", size=2)
     assert kb.complete_task(conn, tid, summary="done")
@@ -376,7 +367,7 @@ def test_complete_task_governed_released_lands_delivery_pending_not_done(kanban_
     session_id / creator_task_id)."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="internal gov", assignee="alice", governed=True)
-        kb.release_task(conn, tid, actor="default", reason="go", capability=_svc_cap())
+        kb.release_task(conn, tid, actor="default", reason="go", authorized=_authorized())
         kb.claim_task(conn, tid)
         kb.add_attachment(conn, tid, filename="r.md", stored_path="/tmp/r.md", size=2)
         assert kb.complete_task(conn, tid, summary="done")
@@ -385,40 +376,39 @@ def test_complete_task_governed_released_lands_delivery_pending_not_done(kanban_
         assert row["acceptance_owner"] == "hermes"
 
 
-def test_release_rejects_without_service_capability(kanban_home):
-    """Slip #007: release_task must reject when no valid service capability is
-    supplied, and must NOT trust caller_identity/actor. Raw state stays
-    todo/execution_authorized=0. (Profile identity is no longer authority.)"""
+def test_release_rejects_without_board_owner_authorization(kanban_home):
+    """Slip #010: release_task must reject when not authorized by the board-owner
+    operational decision, and must NOT trust caller_identity/actor. Raw state
+    stays todo/execution_authorized=0. (Profile identity is not authority.)"""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="release authority", assignee="relay", governed=True)
-        # No capability at all -> rejected.
+        # No authorization at all -> rejected.
         ok, reason = kb.release_task(conn, tid, actor="untrusted-profile", reason="probe")
         assert not ok, reason
         row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
         assert dict(row) == {"status": "todo", "execution_authorized": 0}
 
-        # A forged caller_identity ('hermes') without the capability cannot bypass
-        # the gate (the Slip #005/#006 spoof no longer works).
+        # A forged caller_identity ('hermes') without authorization cannot bypass.
         ok2, _ = kb.release_task(conn, tid, actor="hermes", reason="spoof", caller_identity="hermes")
         assert not ok2
         assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 0
 
-        # A wrong/garbage capability is also rejected.
-        ok3, _ = kb.release_task(conn, tid, actor="hermes", reason="wrong-cap", capability="not-the-secret")
+        # authorized=False explicit -> rejected.
+        ok3, _ = kb.release_task(conn, tid, actor="hermes", reason="not-owner", authorized=False)
         assert not ok3
         assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 0
 
 
-def test_release_with_service_capability_succeeds_once_and_is_idempotent(kanban_home):
-    """The trusted service capability releases once; a concurrent/second release
+def test_release_with_board_owner_authorization_succeeds_once_and_is_idempotent(kanban_home):
+    """The board-owner authorization releases once; a concurrent/second release
     is idempotent and writes no duplicate 'released' event."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="release once", assignee="relay", governed=True)
-        ok, reason = kb.release_task(conn, tid, actor="default", reason="go", capability=_svc_cap())
+        ok, reason = kb.release_task(conn, tid, actor="default", reason="go", authorized=_authorized())
         assert ok, reason
         assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 1
 
-        ok2, _ = kb.release_task(conn, tid, actor="default", reason="again", capability=_svc_cap())
+        ok2, _ = kb.release_task(conn, tid, actor="default", reason="again", authorized=_authorized())
         assert ok2  # idempotent success
         released_events = conn.execute(
             "SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND kind='released'", (tid,)
@@ -431,29 +421,27 @@ def test_release_rejects_nongoverned_task(kanban_home):
     (nothing to release), preserving legacy behavior."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="legacy", assignee="relay")
-        ok, reason = kb.release_task(conn, tid, actor="default", reason="n/a", capability=_svc_cap())
+        ok, reason = kb.release_task(conn, tid, actor="default", reason="n/a", authorized=_authorized())
         assert not ok
 
 
 # ---------------------------------------------------------------------------
-# Slip #007 — server-owned release capability closes the profile-spoof HIGH; the
-# raw-DB-write residual remains OPS #007-OPS (separate Windows identity + ACL),
-# asserted positively so no xfail stands in as proof.
+# Slip #010 — LOCAL OPERATIONAL model. Governed release is a board-owner
+# operational decision; a non-owner profile identity never authorizes. Raw
+# same-user SQLite tampering is OUT OF SCOPE (trusted single-user machine).
 # ---------------------------------------------------------------------------
 
-def test_profile_home_spoof_cannot_release(tmp_path, monkeypatch):
-    """Slip #007 FIX: pointing HERMES_HOME at a .../profiles/hermes directory no
-    longer authorizes a governed release. Authority is the service capability,
-    not the (forgeable) profile identity — so the Slip #005/#006 spoof is dead.
-    Release with only the forged identity (no capability) must fail closed."""
+def test_profile_home_spoof_does_not_authorize_release(tmp_path, monkeypatch):
+    """A profile identity — even one that resolves to 'hermes' via HERMES_HOME —
+    does NOT authorize a governed release; authority is the board-owner
+    operational decision (authorized flag), not caller identity. So a non-owner
+    application path with a forged identity fails closed."""
     from hermes_cli import profiles
-    from hermes_cli import kanban_authority as _ka
     board_home = tmp_path / ".hermes"
     board_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(board_home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
-    _ka._reset_for_tests()  # attacker holds no service capability
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="spoof victim", governed=True, assignee="relay")
     spoof_home = tmp_path / "attacker" / ".hermes" / "profiles" / "hermes"
@@ -462,37 +450,35 @@ def test_profile_home_spoof_cannot_release(tmp_path, monkeypatch):
     import importlib
     importlib.reload(importlib.import_module("hermes_constants"))
     forged = profiles.get_active_profile_name()
-    assert forged == "hermes"  # the identity is still forgeable...
+    assert forged == "hermes"  # identity is forgeable...
     monkeypatch.setenv("HERMES_HOME", str(board_home))
     importlib.reload(importlib.import_module("hermes_constants"))
     with kbc.connect() as conn:
+        # caller_identity is audit-only; without authorized=True it fails closed.
         ok, _ = kb.release_task(conn, tid, actor="x", reason="spoof", caller_identity=forged)
-    # ...but identity no longer authorizes: fail closed.
     assert not ok
-    _ka._reset_for_tests()
 
 
-def test_raw_db_write_bypass_is_unresolved_residual_ops_007(kanban_home):
-    """HONEST residual (NOT a success): the board DB is still a same-user-writable
-    SQLite file, so a raw sqlite3 UPDATE bypasses ALL app authority. This is
-    UNKNOWN/unresolved in-process and depends on OPS #007-OPS (separate Windows
-    service identity + ACL). Asserted positively so no xfail masquerades as proof;
-    when the ACL lands, this test flips and must be replaced by the secure
-    assertion (raw write rejected)."""
+def test_raw_db_write_is_out_of_scope_trusted_local_limitation(kanban_home):
+    """DOCUMENTED SCOPE (Slip #010): on Wessam's trusted single-user machine, a
+    deliberate same-user raw sqlite3 write to the board is OUT OF SCOPE — the
+    governance control defends against accidental/unapproved APPLICATION
+    behavior, not against a malicious same-user process. This test documents that
+    a raw write is possible and is NOT treated as a defect or security gap; it
+    exists so the boundary is explicit, not to claim protection we don't offer."""
     import os
     import sqlite3
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="raw-write victim", governed=True, assignee="relay")
+        tid = kb.create_task(conn, title="raw-write (out of scope)", governed=True, assignee="relay")
     dbpath = kb.kanban_db_path()
-    # The residual precondition: the board file is writable by this same user.
-    assert os.access(dbpath, os.W_OK), "board DB is same-user writable (OPS #007 ACL not applied)"
+    assert os.access(dbpath, os.W_OK), "single-user local: board DB is user-writable by design"
     raw = sqlite3.connect(str(dbpath))
     raw.execute("UPDATE tasks SET execution_authorized=1, status='ready' WHERE id=?", (tid,))
     raw.commit()
     raw.close()
     with kbc.connect() as conn:
         row = conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
-    # Documented residual: the raw write DID bypass the gate. Application code
-    # cannot prevent this until the DB is ACL-restricted to a service account.
+    # Out of scope, documented: a raw same-user write is not something the
+    # application layer prevents on a trusted local box. Not a defect.
     assert row["execution_authorized"] == 1
 

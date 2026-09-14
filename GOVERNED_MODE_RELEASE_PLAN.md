@@ -1,103 +1,101 @@
-# Governed mode — Release plan (later, separately-approved gateway restart)
+# Governed mode — Release plan (LOCAL OPERATIONAL scope, Slip #010)
 
-Status: CODE + TESTS COMPLETE for Slip #009 (remove confused deputy; server-
-internal governed authority). READY FOR SENTINEL RE-REVIEW. NOT independently
-approved. NO restart, build, deploy, config rollout, board mutation, live
-account/service/ACL, or remote action was performed.
+Status: CODE + TESTS COMPLETE for Slip #010 (resume original Council reliability
+under the LOCAL OPERATIONAL threat model). READY FOR HERMES TECHNICAL ACCEPTANCE.
+NOT live. No restart/build/deploy, no board/config mutation, no account/service/
+ACL/DB migration, no remote action was performed.
 
-Slip: #009 — Remove confused deputy; server-internal governed authority.
-Branch: relay/slip009-remove-confused-deputy
-Review SHA (this remediation): HEAD of branch relay/slip009-remove-confused-deputy
-  (exact SHA reported in the delivery receipt; a commit cannot embed its own hash)
-Base (reviewed NEEDS_CHANGES, Slip #008 confused-deputy HIGH): 2ad329078f866b2ce4caeefb6a8d0ebce0f6b105
-Re-review: PENDING — Sentinel, on the exact new SHA, after this handoff.
+Slip: #010 — Local operational governance (Option A OS-isolation STOPPED).
+Branch: relay/slip010-local-operational-governance
+Review SHA: HEAD of branch relay/slip010-local-operational-governance
+  (exact SHA in the delivery receipt; a commit cannot embed its own hash)
+Base: 9135f1b0dd0ad4ab4587d97d8c0d5e8c39091906 (Slip #009 candidate baseline)
+Review method: one fresh temporary read-only code-review helper (NOT Sentinel;
+  Sentinel is external/customer-facing security only). Prior Sentinel findings are
+  historical evidence only.
 
-## Lineage (for audit only — do not target these for approval/rollback)
-Slip #002 governed mode -> #004 authority boundary -> #006 BLOCKED-ARCHITECTURE
-memo -> #007 capability vertical slice (introduced the confused deputy) -> #008
-review found the deputy HIGH -> #009 (this) removes it. The ONLY branch/SHA to
-review or roll back is this Slip #009 branch at the SHA in the receipt.
+## Threat model (Wessam, explicit)
+This is a trusted single-user local computer. The Council/governed control's job
+is to prevent ACCIDENTAL or unapproved APPLICATION behavior by agents and UI/tool
+paths. It does NOT defend against a malicious same-user administrator who
+deliberately raw-writes the SQLite board, retargets OS files, or debugs
+processes. Raw same-user SQLite/file/process tampering is OUT OF SCOPE and is a
+documented trusted-local limitation — not a defect, not an unresolved security
+gap, and no security is claimed against it.
 
-## What Slip #009 changed vs the NEEDS_CHANGES SHA (2ad329)
-- REMOVED the privileged `governed-release` / `governed-accept-internal` verbs
-  from the generic gateway control socket (gateway/run.py, gateway/control_socket.py).
-  A raw JSON request for either is now an unknown verb -> rejected, zero mutation.
-  This closes the Slip #008 confused-deputy: no unauthenticated local caller can
-  make the gateway spend its capability.
-- Privileged release + internal acceptance are SERVER-INTERNAL only
-  (kanban_db.release_task / accept_internal_governed_delivery gated by the
-  in-process capability). No local verb exposes them.
-- SINGLE board-authority owner: kanban_authority.should_mint_board_authority()
-  mints/holds the capability ONLY in the default-home board-owner process; every
-  secondary profile gateway holds no authority (fixes the Slip #007 over-mint
-  where every gateway was a deputy).
-- Ordinary CLI/agents get a durable NON-AUTHORITATIVE request only
-  (kanban_db.submit_release_request -> `release_requested` event); it never
-  changes execution_authorized/status and cannot auto-approve. The board-owner
-  resolves requests separately from persisted policy; caller fields are audit
-  provenance, never authority.
-- Internal no-session acceptance still completes through the trusted internal
-  path; missing owner/capability fails before mutation (no strand, no false Done).
+## What Slip #010 changed vs base 9135f1b0
+- Simplified `hermes_cli/kanban_authority.py` to a single process-ROLE check
+  `is_board_authority_owner()` (default-home process = the operational board
+  owner). REMOVED the Slip #007/#009 secret-capability machinery (mint, 0o600
+  capability file, constant-time verify, in_process_capability) — it existed only
+  for the abandoned Option A OS-security direction and added no value here.
+- `release_task(..., authorized: bool)`: governed release requires the board-owner
+  operational decision (`authorized=True`), not a secret and not caller identity.
+  caller_identity/actor stay audit provenance only. Delegated children rejected.
+- `accept_internal_governed_delivery(..., authorized: bool)`: same board-owner
+  operational gate; internal no-session governed work still completes end-to-end
+  (delivery_pending -> done by the named owner) and never strands.
+- CLI `release`: board-owner releases directly; a non-owner submits a durable,
+  NON-AUTHORITATIVE request (`submit_release_request` -> `release_requested`
+  event) that never changes state and cannot auto-approve.
+- gateway/run.py: removed the capability mint at control-socket start (nothing to
+  mint). The Slip #008 confused-deputy fix stands — NO privileged release/accept
+  verb is exposed on the generic control socket.
+- Removed Option A docs: GOVERNED_RELEASE_ARCHITECTURE_DECISION.md,
+  GOVERNED_SERVICE_BOUNDARY_DESIGN.md, OPS_007_DESIGN_INTEGRATION.md (they existed
+  solely for the abandoned OS-security direction).
 
-## Authority model / trust boundary (honest — OPS #007-OPS still pending)
-Release/accept authority = possession of the server-internal capability, held by
-the single board-owner process. What is REAL and tested: the confused-deputy
-socket surface is gone; a non-owner can only request; only the owner-context
-capability path executes; internal acceptance is owner + capability gated.
-What remains UNKNOWN / OPS #007-OPS: on a single-user box with no separate
-Windows service identity + ACL, "board owner" is a process-role convention, not
-an OS-enforced identity — a hostile same-user process could still set HERMES_HOME
-to the default home to become "owner", RAW-WRITE the board DB, or read the
-capability file. The capability/role becomes a real SECURITY boundary ONLY once
-the board DB + capability file are ACL-restricted to a dedicated Windows service
-account per the Ops #007-OPS design (virtual account NT SERVICE\HermesBoard,
-ACL'd named pipe, direct-write denial). NO ACL/live proof exists yet; the
-raw-DB-write residual is asserted positively in tests as an unresolved gap.
+## In-scope invariants (all reproved by focused tests)
+1. Governed mode opt-in; non-governed legacy unchanged.
+2. Governed tasks do not auto-promote/decompose/reassign/review-dispatch.
+3. Dashboard/CLI/tool/direct application lifecycle paths cannot ready/run/done
+   governed work before explicit release + named acceptance.
+4. Release request is non-authoritative and cannot auto-approve; the trusted
+   default-Hermes board-owner makes the operational decision; profile/actor audit
+   only.
+5. Conversation-origin tasks have durable delivery binding/receipt; internal
+   no-session tasks have a usable durable acceptance; executor cannot self-accept
+   through normal app/tool surfaces.
+6. Review requires a distinct reviewer and no same-profile auto-redispatch.
+7. No privileged release/accept verbs on the generic control socket.
+8. Raw same-user SQLite/file/process tampering OUT OF SCOPE, documented as a
+   trusted-local limitation (test documents it as such, not as a defect).
 
-## Proof no restart / no live action occurred during this slip
-- No `hermes desktop --force-build`, `npm run build`, PM2 action, gateway
-  stop/start, `serve` restart, account/service/ACL creation, or DB migration.
-  All work = file edits + reads + `scripts/run_tests.sh` in the isolated worktree
-  (.worktrees/slip009-remove-confused-deputy), never the live checkout/board.
-- Prior worktrees preserved untouched (slip007 2ad329, slip006 5d28f31e,
-  slip004 65542e1d, slip002 3565cbba).
-- The running gateway/Desktop tree is untouched; changes are inert until an
-  approved restart reloads sys.modules.
+## Proof no live action occurred
+- No `hermes desktop --force-build`, `npm run build`, PM2 action, gateway/serve
+  restart, account/service/ACL creation, or DB migration. All work = file edits +
+  reads + `scripts/run_tests.sh` in the isolated worktree
+  (.worktrees/slip010-local-operational-governance), never the live checkout/board.
+- Prior worktrees preserved untouched (slip009 9135f1b0, slip007 2ad329,
+  slip006 5d28f31e, slip004 65542e1d, slip002 3565cbba).
 
 ## Restart scope (when Wessam approves, executed by Ops externally)
-1. Integrate the approved SHA into the live checkout preserving unrelated dirty
+1. Integrate the accepted SHA into the live checkout preserving unrelated dirty
    work (guarded-worktree + patch pattern).
-2. Package Desktop via `hermes desktop --force-build --build-only` (release-tree
-   Hermes.exe only; no PM2/fleet kill).
-3. Relaunch the packaged app externally (`hermes desktop --skip-build`).
-4. Restart the lock-holder gateway from an Ops (non-Desktop-hosted) context so
-   its sys.modules reload; do NOT broad-kill the fleet.
-5. The OS ACL / Windows service-account cutover (Ops #007-OPS) is a SEPARATE,
-   separately-approved step with its own §9 shadow tests — NOT part of this slip
-   and NOT to be bundled into the restart.
+2. Package Desktop via `hermes desktop --force-build --build-only`; relaunch the
+   packaged app externally (`hermes desktop --skip-build`).
+3. Restart the lock-holder gateway from an Ops (non-Desktop) context so its
+   sys.modules reload; do NOT broad-kill the fleet.
+No OS ACL / Windows service-account work is part of this or any follow-up — that
+direction is stopped.
 
 ## Health checks after restart
-- `hermes kanban release <id>` from a non-owner profile RECORDS a request and
-  does NOT authorize; from the board-owner context it releases.
-- A raw JSON `governed-release`/`governed-accept-internal` to the gateway control
-  socket returns unknown-verb; state unchanged.
+- `hermes kanban release <id>` from a non-owner profile records a request and
+  does NOT authorize; from the board-owner (default) context it releases.
 - Governed create lands todo/execution_authorized=0; dashboard drag/PATCH/bulk to
   ready/done on an unreleased governed task returns 409; internal no-session
-  governed work reaches done only via the trusted owner acceptance path.
-- `gateway status` responds; new gateway PID owns the dispatcher lock;
-  gateway_state.json code_sha matches the built dist.
+  governed work reaches done only via the board-owner acceptance path.
+- A raw JSON governed-release/accept to the control socket returns unknown-verb.
 
 ## Rollback
-- Live app: existing `release/win-unpacked.bak` restored automatically on failed
-  integrity-gated staged swap.
-- Source: revert to base 2ad329078f866b2ce4caeefb6a8d0ebce0f6b105 (this slip is
-  additive; governed defaults 0; the new event/request rows are inert for
-  non-governed work — no data migration to undo).
-- If post-restart E2E fails: STOP, capture package hash/PIDs/logs, escalate to
-  Hermes for a controlled rollback decision (no hand-swap/broad-kill).
+- Live app: existing `release/win-unpacked.bak` restored automatically on a
+  failed integrity-gated staged swap.
+- Source: revert to base 9135f1b0dd0ad4ab4587d97d8c0d5e8c39091906 (additive;
+  governed defaults 0; new event/request rows inert for non-governed work — no
+  data migration to undo).
 
 ## Governance note
-This slip authorized code + tests ONLY. The live-gateway restart, the Windows
-service-account/ACL cutover, config enabling of governed mode on any board,
-all-board migration, and any remote push/PR/publish remain separately gated on
-Wessam's approval via Hermes. No ACL/live-identity security is claimed here.
+Code + tests only. Live-gateway restart, config enabling of governed mode on any
+board, all-board migration, and any remote push/PR/publish remain separately
+gated on Wessam's approval via Hermes. No OS/ACL/service-identity security is
+claimed.

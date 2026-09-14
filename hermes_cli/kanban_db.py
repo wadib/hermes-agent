@@ -2755,32 +2755,32 @@ def accept_delivery(
 
 def accept_internal_governed_delivery(
     conn: sqlite3.Connection, task_id: str, *, accepting_owner: str,
-    capability: Optional[str] = None,
+    authorized: bool = False,
 ) -> bool:
-    """Slip #007 durable internal acceptance route for governed work with NO
+    """Slip #007/#010 durable internal acceptance route for governed work with NO
     conversation origin (``session_id`` is None).
 
     Slip #005 HIGH #2: forcing ``delivery_required`` on internal governed tasks
     left them stranded at ``delivery_pending`` — the conversation-delivery
     machinery (outbox platform/conversation_ref, notify subscription) never
     applies, so ``awaiting_acceptance`` was unreachable and the named owner could
-    never accept. This provides the missing route: the trusted board service
-    (holding ``capability``) finalizes an internal governed task directly from
-    ``delivery_pending`` to ``done`` on behalf of the named ``acceptance_owner``,
-    recording a durable ``task_acceptances`` row.
+    never accept. This provides the missing route: the trusted board-owner
+    (``authorized`` from :func:`kanban_authority.is_board_authority_owner`)
+    finalizes an internal governed task directly from ``delivery_pending`` to
+    ``done`` on behalf of the named ``acceptance_owner``, recording a durable
+    ``task_acceptances`` row.
 
     Fail-closed conditions (each returns False, none strand silently):
-    - invalid/missing service capability (authority, not identity);
+    - not the trusted board-owner operational context (``authorized`` False);
     - task missing / not governed / has a conversation origin (session_id set —
       that path uses the gateway/desktop acceptance, not this one);
     - task not in ``delivery_pending``;
     - ``accepting_owner`` is not the task's named acceptance owner;
     - an acceptance already exists (idempotent guard).
     """
-    from hermes_cli import kanban_authority
-    if not kanban_authority.verify_capability(capability):
+    if not authorized:
         _append_event(conn, task_id, "acceptance_rejected", {
-            "reason": "missing_or_invalid_service_capability", "source": "internal_service",
+            "reason": "not_board_authority_owner", "source": "internal_service",
         })
         return False
     accepting_owner = str(accepting_owner or "").strip()
@@ -4267,26 +4267,26 @@ def submit_release_request(
 
 def release_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    caller_identity: Optional[str] = None, capability: Optional[str] = None,
+    caller_identity: Optional[str] = None, authorized: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Slip #002/#004/#007 explicit release: grant a governed task execution authority.
+    """Slip #002/#004/#010 explicit release: grant a governed task execution authority.
 
     A governed task is created ``execution_authorized=0`` and cannot claim/run
     or auto-promote until this durable action fires. Writes an auditable
     ``released`` event and, when parents are satisfied, promotes it to its
     resumable phase via ``recompute_ready``. Returns ``(ok, reason)``.
 
-    Authority (Slip #007): the release is permitted ONLY when ``capability``
-    matches the trusted board service's minted secret
-    (:func:`kanban_authority.verify_capability`). This replaces the Slip #004
-    profile-identity check, which was forgeable via HERMES_HOME (Slip #005/#006).
-    ``caller_identity`` and ``actor`` are retained as audited provenance only and
-    NEVER confer authority. Delegated-child contexts are rejected outright.
+    Authority (Slip #010, LOCAL OPERATIONAL model): ``authorized`` must be True,
+    and the caller sets it ONLY from the trusted board-owner process role
+    (:func:`kanban_authority.is_board_authority_owner`). This is an operational
+    control preventing accidental release from a non-owner application path — NOT
+    a defense against a malicious same-user process (out of scope). Delegated
+    children are rejected outright. ``caller_identity`` and ``actor`` are audit
+    provenance only and NEVER confer authority.
 
     Refused for a non-governed task (there is nothing to release) and idempotent
     on an already-released task.
     """
-    from hermes_cli import kanban_authority
     task = get_task(conn, task_id)
     if task is None:
         return False, f"task {task_id} not found"
@@ -4294,18 +4294,18 @@ def release_task(
         return False, f"task {task_id} is not governed; release does not apply"
     if task.execution_authorized:
         return True, None  # already released — idempotent (no duplicate event)
-    # Fail closed: a delegated child may never release, and only a holder of the
-    # trusted service capability may. Profile identity / actor is not authority.
+    # Fail closed: a delegated child may never release, and only the trusted
+    # board-owner operational decision may. Profile identity / actor is not authority.
     _assert_not_delegated_child_mutation()
-    if not kanban_authority.verify_capability(capability):
+    if not authorized:
         _append_event(conn, task_id, "release_rejected", {
-            "reason": "missing_or_invalid_service_capability",
+            "reason": "not_board_authority_owner",
             "caller_identity": (caller_identity or None),
             "actor": actor,
         })
         return False, (
-            "governed release requires the trusted board-service capability; "
-            "profile identity does not authorize release (Slip #007)"
+            "governed release is an operational decision reserved to the trusted "
+            "board-owner (default Hermes) context; submit a release request instead"
         )
     with write_txn(conn):
         cur = conn.execute(
@@ -4318,7 +4318,7 @@ def release_task(
             # the event; report idempotent success without a duplicate event.
             return True, None
         _append_event(conn, task_id, "released", {
-            "actor": actor, "reason": reason, "authorized_by": "service_capability",
+            "actor": actor, "reason": reason, "authorized_by": "board_owner",
             "caller_identity": (caller_identity or None),
         })
     # Outside the txn (own IMMEDIATE txn): a released, parent-satisfied task
