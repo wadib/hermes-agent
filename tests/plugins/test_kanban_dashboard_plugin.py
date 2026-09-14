@@ -1415,6 +1415,46 @@ def test_dashboard_approved_waits_for_unsatisfied_parent(client):
     assert [event["kind"] for event in events][-1:] == ["approved"]
 
 
+def test_dashboard_approved_rejects_running_task_without_orphaning_run(client):
+    """A running card must be reclaimed through its dedicated lifecycle before a
+    human can approve it. PATCH and bulk both reject approval with no status,
+    claim, run, or event mutation — preventing a live worker hidden under ready."""
+    import secrets
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="running approval", assignee="relay")
+        lock = secrets.token_hex(8)
+        future = int(time.time()) + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, worker_pid=? WHERE id=?",
+            (lock, future, 99999, task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?)",
+            (task_id, lock, future, 99999, int(time.time())),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+
+    rejected = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "approved"})
+    assert rejected.status_code == 400, rejected.text
+    bulk = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [task_id], "status": "approved"})
+    assert bulk.status_code == 200, bulk.text
+    assert bulk.json()["results"] == [{"id": task_id, "ok": False, "error": "Cannot approve a running task; reclaim it first"}]
+    with kbc.connect() as conn:
+        task = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        run = conn.execute("SELECT status, claim_lock, claim_expires, worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
+    assert dict(task) == {
+        "status": "running", "claim_lock": lock, "claim_expires": future,
+        "worker_pid": 99999, "current_run_id": run_id,
+    }
+    assert dict(run) == {"status": "running", "claim_lock": lock, "claim_expires": future, "worker_pid": 99999}
+    assert [event["kind"] for event in events] == ["created"]
+
+
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------

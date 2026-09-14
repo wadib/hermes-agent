@@ -635,6 +635,14 @@ def _approve_task(conn, task_id: str, p) -> bool:
     correctly won't dispatch a task whose upstream work isn't done."""
     now = int(time.time())
     with kanban_db.write_txn(conn):
+        current = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if current is None:
+            return False
+        # Running work is owned by an active worker/run. APPROVED must not bypass
+        # the established reclaim path (which clears the claim, closes the run,
+        # and terminates the worker post-commit); the human must reclaim first.
+        if current["status"] == "running":
+            raise _StatusRejected("Cannot approve a running task; reclaim it first")
         cur = conn.execute("UPDATE tasks SET status = 'approved' WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
