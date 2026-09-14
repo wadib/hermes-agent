@@ -1,27 +1,60 @@
-# Slip #002 — Release plan (later, separately-approved gateway restart)
+# Governed mode — Release plan (later, separately-approved gateway restart)
 
-Status at handoff: CODE + TESTS COMPLETE and independently APPROVED. NO restart,
-build, deploy, config rollout, or board mutation performed during this slip.
+Status at handoff: CODE + TESTS COMPLETE for Slip #004 remediation; READY FOR
+SENTINEL RE-REVIEW. NOT independently approved yet — the prior Slip #002 SHA was
+returned NEEDS_CHANGES by Hermes/Sentinel (dashboard governed bypass CRITICAL +
+release-authority HIGH). NO restart, build, deploy, config rollout, or board
+mutation was performed during this slip.
 
-Branch: relay/slip002-governed-mode
-Final commit: 9270fe9db81f0e7c2e602f35292c21ae8cf30b1b (fork/relay/slip002-governed-mode, remote verified equal)
-Base: 359190776094ec9f2e5ec16e18e9dc8d63c7864d
+Branch: relay/slip004-governed-authority
+Review SHA (this remediation): HEAD of branch relay/slip004-governed-authority
+  (exact SHA reported in the delivery receipt; a commit cannot embed its own hash)
+Reviewed-and-superseded base (NEEDS_CHANGES): 3565cbba9cacc73e5926312817aac3bbda7fd338
+Original governed-mode base: 359190776094ec9f2e5ec16e18e9dc8d63c7864d
+Re-review: PENDING — Sentinel under a new review slip after this handoff.
+
+## What Slip #004 changed vs the NEEDS_CHANGES SHA
+- Central governed authority boundary `assert_governed_transition_allowed()` in
+  kanban_db.py, shared by every status surface. A governed unreleased task
+  cannot enter ready/running/review, and no governed task reaches `done` outside
+  the acceptance lifecycle.
+- Dashboard `_set_status_direct` now calls the boundary (drag/PATCH/bulk);
+  refusals surface as HTTP 409, raw state stays todo + execution_authorized=0.
+- `complete_task` refuses an unreleased governed task at the DB boundary
+  regardless of caller surface (dashboard "done", CLI, tool).
+- `create_task` forces delivery_required for ALL governed work (internal AND
+  conversation-origin), so internal governed work cannot skip acceptance.
+- `release_task` is gated on a server-resolved caller identity
+  (`resolve_release_authorities()`, fail-closed default {'hermes'} + board
+  orchestrator_profile, widenable via `kanban.governed_release_authorities`);
+  caller-supplied `actor` is audit provenance only and confers no authority.
+
+## Authority model / trust boundary (honest limitation)
+Release authority is a durable config policy checked against the caller identity
+resolved by the trusted ingress (CLI active profile; gateway/Desktop trusted
+session identity). This enforces "only configured release-authority profiles may
+release" and rejects normal profiles and delegated children at the DB boundary.
+It is NOT cryptographic: on a local single-user install, profile identity is
+process/HERMES_HOME-derived, so a local user who can set HERMES_HOME/env is
+outside this control's threat model. No claim of cryptographic security is made.
 
 ## Proof no restart occurred during this slip
 - No `hermes desktop --force-build`, `npm run build`, PM2 action, gateway
   stop/start, or `serve` restart was invoked. All work was file edits + reads +
   `scripts/run_tests.sh` in an ISOLATED git worktree
-  (.worktrees/slip002-governed-mode), never the live checkout.
+  (.worktrees/slip004-governed-authority), never the live checkout.
+- The review worktree (.worktrees/slip002-governed-mode) is preserved untouched
+  at 3565cbba... including its untracked `%SystemDrive%/` residue for audit.
 - The running gateway/Desktop process tree is untouched; it still holds the
-  pre-Slip-#002 sys.modules. The change takes effect ONLY after an approved
+  pre-remediation sys.modules. The change takes effect ONLY after an approved
   restart (see below).
 
 ## Why a restart is eventually required (not now)
-The kanban lifecycle (kanban_db, kanban_db_dispatch, kanban_decompose) and the
-gateway/tui acceptance ingress are imported into the live gateway and Desktop
-`serve` backend at boot. A running gateway keeps the OLD modules in sys.modules;
-new governed-mode behavior is inert until those processes reload. This is the
-same mixed-sys.modules constraint noted for t_32b4f7a3.
+The kanban lifecycle (kanban_db, kanban_db_dispatch, kanban_decompose), the
+dashboard plugin_api, and the gateway/tui acceptance ingress are imported into
+the live gateway and Desktop `serve` backend at boot. A running gateway keeps
+the OLD modules in sys.modules; new governed-mode behavior is inert until those
+processes reload. Same mixed-sys.modules constraint noted for t_32b4f7a3.
 
 ## Restart scope (when Wessam approves, executed by Ops externally)
 1. Integrate the approved SHA into the live checkout preserving unrelated dirty
@@ -32,11 +65,18 @@ same mixed-sys.modules constraint noted for t_32b4f7a3.
 4. The messaging gateway (survives the app) must also be restarted so its
    sys.modules reload — restart only the lock-holder gateway from an Ops
    (non-Desktop-hosted) context; do NOT broad-kill the fleet.
+5. Configure `kanban.governed_release_authorities` for the operator's release
+   profile BEFORE enabling governed mode on any board (else release fails closed
+   for every profile except 'hermes'/orchestrator_profile).
 
 ## Health checks after restart
 - `hermes kanban ...` on a governed-flagged board: a governed create lands
-  `todo` execution_authorized=0; `hermes kanban release <id>` promotes to ready;
-  a dispatcher tick does NOT claim it before release.
+  `todo` execution_authorized=0; `hermes kanban release <id>` from an authorized
+  profile promotes to ready; an unauthorized profile's release is refused; a
+  dispatcher tick does NOT claim it before release.
+- Dashboard: dragging/PATCHing a governed unreleased task to ready/done returns
+  409 and leaves raw state todo/0; a governed task reaches done only via the
+  acceptance lifecycle by the named acceptance_owner.
 - Governed review requires a distinct reviewer; governed triage is not
   auto-decomposed; a governed conversation task completes to delivery_pending,
   and only the named acceptance_owner finalizes.
@@ -54,5 +94,5 @@ same mixed-sys.modules constraint noted for t_32b4f7a3.
 
 ## Governance note
 This slip authorized code + tests ONLY. The live-gateway restart, config
-enabling of governed mode on any board, and all-board migration remain
-separately gated on Wessam's approval via Hermes.
+enabling of governed mode on any board, all-board migration, and any remote
+push/PR/publish remain separately gated on Wessam's approval via Hermes.

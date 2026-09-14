@@ -143,6 +143,113 @@ def _assert_not_delegated_child_mutation() -> None:
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
 
+class GovernedTransitionError(ValueError):
+    """A governed task's status transition was refused at the authority boundary.
+
+    Raised when any surface (dashboard PATCH/bulk/drag, direct status write,
+    complete_task) tries to move a governed task into an executable/final phase
+    without the required durable authority (explicit release, or the governed
+    acceptance lifecycle for ``done``). A ``ValueError`` so the dashboard's
+    existing error mapping turns it into a clear 4xx.
+    """
+
+
+# Governed transitions that require prior execution authority (an explicit
+# release). A governed task in any of these has already passed the release gate;
+# entering them from an unreleased governed task is the bypass class.
+_GOVERNED_EXECUTABLE_STATUSES = frozenset({"ready", "running", "review"})
+# ``done`` for governed work is reachable ONLY through the acceptance lifecycle
+# (accept_delivery_from_gateway/desktop), never a direct status write.
+_GOVERNED_TERMINAL_VIA_ACCEPTANCE = frozenset({"delivery_pending", "awaiting_acceptance", "done"})
+
+
+def resolve_release_authorities() -> set[str]:
+    """The set of profile identities permitted to release governed work.
+
+    Fail-closed default is ``{'hermes'}`` (the governance owner / default
+    acceptance owner). Operators may widen it via
+    ``kanban.governed_release_authorities`` (list of profile names) and the
+    board ``orchestrator_profile`` is always included when configured. Reading
+    config is best-effort; on any failure the fail-closed default stands.
+    """
+    authorities = {"hermes"}
+    try:
+        from hermes_cli.config import load_config_readonly
+        kcfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+        configured = kcfg.get("governed_release_authorities")
+        if isinstance(configured, (list, tuple)):
+            authorities.update(str(a).strip() for a in configured if str(a).strip())
+        orch = str(kcfg.get("orchestrator_profile") or "").strip()
+        if orch:
+            authorities.add(orch)
+    except Exception:
+        pass
+    return authorities
+
+
+def _is_release_authorized(caller_identity: Optional[str]) -> bool:
+    """True iff ``caller_identity`` (server-resolved, never caller-supplied audit
+    text) is in the durable release-authority set. Delegated-child contexts are
+    rejected separately by ``_assert_not_delegated_child_mutation``.
+
+    Local trust limitation (documented honestly): profile identity on a local
+    single-user install is process/HERMES_HOME-derived, not cryptographic. This
+    enforces "only configured release-authority profiles may release" but cannot
+    defend against a local user who can set HERMES_HOME/env.
+    """
+    ident = (caller_identity or "").strip()
+    if not ident:
+        return False
+    return ident in resolve_release_authorities()
+
+
+def assert_governed_transition_allowed(
+    conn: sqlite3.Connection, task_id: str, target_status: str, *, via: str,
+) -> None:
+    """Central governed authority boundary shared by EVERY status surface.
+
+    Raises :class:`GovernedTransitionError` when a governed task is moved into an
+    executable phase (ready/running/review) without a prior explicit release
+    (``execution_authorized=1``), or into a delivery/acceptance/done phase by any
+    path other than the trusted governed lifecycle op (``via`` names the caller).
+
+    Non-governed tasks are never constrained here (legacy behavior unchanged).
+    ``via='acceptance'`` is the only path permitted to land a governed task in
+    delivery_pending/awaiting_acceptance/done; ``via='complete_task'`` may land
+    ``delivery_pending`` (the acceptance lifecycle entry) for a RELEASED governed
+    task but never ``done`` directly.
+    """
+    row = conn.execute(
+        "SELECT governed, execution_authorized FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or not _row_get(row, "governed"):
+        return  # unknown or non-governed: no governed constraint
+    released = bool(_row_get(row, "execution_authorized"))
+    if target_status in _GOVERNED_EXECUTABLE_STATUSES and not released:
+        raise GovernedTransitionError(
+            f"governed task {task_id} cannot enter {target_status!r} before an "
+            f"explicit authorized release (attempted via {via})"
+        )
+    if target_status in _GOVERNED_TERMINAL_VIA_ACCEPTANCE:
+        # done is acceptance-only; delivery_pending/awaiting_acceptance only via
+        # the trusted lifecycle ops.
+        if target_status == "done" and via != "acceptance":
+            raise GovernedTransitionError(
+                f"governed task {task_id} can only reach 'done' through the "
+                f"acceptance lifecycle (attempted via {via})"
+            )
+        if via not in ("acceptance", "complete_task"):
+            raise GovernedTransitionError(
+                f"governed task {task_id} cannot be placed in {target_status!r} "
+                f"directly (attempted via {via})"
+            )
+        if not released:
+            raise GovernedTransitionError(
+                f"governed task {task_id} cannot enter {target_status!r} before "
+                f"an explicit authorized release (attempted via {via})"
+            )
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
@@ -1481,10 +1588,11 @@ def create_task(
         # Fail-closed: a governed task cannot run until an explicit release_task.
         # Parent completion alone must never grant execution authority.
         execution_authorized = False
-        # Conversation-originated governed work must bind a durable delivery
-        # receipt before it can be represented as delivered/Done.
-        if session_id or creator_task_id:
-            delivery_required = True
+        # Slip #004: ALL governed work (internal AND conversation-originated)
+        # must go through the delivery/acceptance lifecycle before done — an
+        # internal governed task must not skip acceptance merely because it has
+        # no session_id/creator_task_id.
+        delivery_required = True
         # Internal governed work defaults to Hermes as the named acceptance
         # owner; callers name a different owner for sensitive/approval-bound work.
         if not (acceptance_owner or "").strip():
@@ -3394,6 +3502,20 @@ def complete_task(
         _stage_completion_artifacts(conn, task_id, metadata, now)
     task = get_task(conn, task_id)
     delivery_required = bool(task and task.delivery_required)
+    # Slip #004 central authority boundary: a governed task cannot be completed
+    # (to done or delivery_pending) unless it was explicitly released, and a
+    # governed task never reaches 'done' directly — it must go through the
+    # delivery/acceptance lifecycle. This holds regardless of caller surface
+    # (CLI, dashboard done -> complete_task, tool).
+    if task is not None and task.governed:
+        # complete_task always lands delivery_pending for a released governed
+        # task (delivery_required is forced True at create for governed work);
+        # the guard rejects an unreleased governed completion outright.
+        if not task.execution_authorized:
+            _append_event(conn, task_id, "completion_rejected", {
+                "reason": "governed_task_not_released", "via": "complete_task",
+            })
+            return False
     # A delivery-required task without a durable attachment cannot enter a
     # pending state: there is nothing the notifier can prove it delivered.
     if delivery_required and not list_attachments(conn, task_id):
@@ -4047,13 +4169,20 @@ def request_changes(
 
 def release_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
+    caller_identity: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Slip #002 explicit release: grant a governed task execution authority.
+    """Slip #002/#004 explicit release: grant a governed task execution authority.
 
     A governed task is created ``execution_authorized=0`` and cannot claim/run
     or auto-promote until this durable action fires. Writes an auditable
     ``released`` event and, when parents are satisfied, promotes it to its
     resumable phase via ``recompute_ready``. Returns ``(ok, reason)``.
+
+    Authority (Slip #004): the release is permitted ONLY when ``caller_identity``
+    — resolved by the trusted ingress (CLI: active profile; NOT a caller-supplied
+    audit string) — is in the durable release-authority set
+    (:func:`resolve_release_authorities`). Delegated-child contexts are rejected.
+    ``actor`` is retained as audited provenance only and never confers authority.
 
     Refused for a non-governed task (there is nothing to release) and idempotent
     on an already-released task.
@@ -4064,7 +4193,20 @@ def release_task(
     if not task.governed:
         return False, f"task {task_id} is not governed; release does not apply"
     if task.execution_authorized:
-        return True, None  # already released — idempotent
+        return True, None  # already released — idempotent (no duplicate event)
+    # Fail closed: a delegated child may never release, and only a trusted
+    # configured release authority may. actor audit text is not authority.
+    _assert_not_delegated_child_mutation()
+    if not _is_release_authorized(caller_identity):
+        _append_event(conn, task_id, "release_rejected", {
+            "reason": "unauthorized_release_authority",
+            "caller_identity": (caller_identity or None),
+            "actor": actor,
+        })
+        return False, (
+            f"caller {caller_identity!r} is not an authorized governed-release "
+            f"authority (configure kanban.governed_release_authorities)"
+        )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET execution_authorized = 1 "
@@ -4072,8 +4214,12 @@ def release_task(
             (task_id,),
         )
         if cur.rowcount != 1:
-            return False, f"task {task_id} release lost a race (status changed)"
-        _append_event(conn, task_id, "released", {"actor": actor, "reason": reason})
+            # Lost the race to a concurrent release — that release already wrote
+            # the event; report idempotent success without a duplicate event.
+            return True, None
+        _append_event(conn, task_id, "released", {
+            "actor": actor, "reason": reason, "authorized_by": caller_identity,
+        })
     # Outside the txn (own IMMEDIATE txn): a released, parent-satisfied task
     # flips to ready now instead of idling until the next tick.
     recompute_ready(conn)

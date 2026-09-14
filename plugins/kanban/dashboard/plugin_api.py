@@ -679,7 +679,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        with _map_errors(409, kanban_db.GovernedTransitionError), _map_errors(400, _StatusRejected):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -689,6 +689,15 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if blockers:
         names = ", ".join(f"{p['title']!r} ({p['id']}, status={p['status']})" for p in blockers)
         raise _conflict(f"Cannot move to 'ready': blocked by parent(s) not done — {names}")
+    # A governed task whose completion/transition was refused at the DB boundary
+    # (complete_task returned False for an unreleased governed task) surfaces as
+    # a 409 rather than a generic "not valid from current state".
+    gov = kanban_db.get_task(conn, task_id)
+    if gov is not None and getattr(gov, "governed", False) and not gov.execution_authorized \
+            and s in ("done", "ready", "running", "review"):
+        raise _conflict(
+            f"governed task {task_id} cannot transition to {s!r} before an authorized release"
+        )
     raise _conflict(f"status transition to {s!r} not valid from current state")
 
 
@@ -778,6 +787,11 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
                 effective_status = "review" if kanban_db._parents_satisfied(conn, task_id) else "todo"
+        # Slip #004: governed authority boundary — a governed task cannot be
+        # dragged/direct-written into an executable phase without an explicit
+        # release. Raises GovernedTransitionError (mapped to 409 by the router).
+        kanban_db.assert_governed_transition_allowed(
+            conn, task_id, effective_status, via="dashboard_direct")
         # Never promote to 'ready' unless all parents are done/archived — otherwise the
         # dispatcher spawns a child whose upstream work hasn't completed.
         if effective_status == "ready" and not kanban_db._parents_satisfied(conn, task_id):

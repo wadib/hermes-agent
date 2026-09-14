@@ -1287,6 +1287,71 @@ def test_specify_happy_path(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Slip #004 — governed authority boundary: dashboard cannot bypass release/acceptance
+# (ports Sentinel DIRECT_REVIEW_SLIP_003 dashboard regression spec)
+# ---------------------------------------------------------------------------
+
+
+def test_governed_unreleased_task_dashboard_cannot_reach_ready_or_done(client):
+    """A governed, unreleased task must not be moved to ready or done via the
+    dashboard PATCH surface. Both must fail clearly (400/403/409) and leave the
+    raw row at todo/execution_authorized=0."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="governed bypass regression", governed=True, assignee="relay")
+
+    ready = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "ready"})
+    assert ready.status_code in {400, 403, 409}, ready.text
+
+    done = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "result": "not accepted"},
+    )
+    assert done.status_code in {400, 403, 409}, done.text
+
+    with kbc.connect() as conn:
+        row = conn.execute(
+            "SELECT status, execution_authorized FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+    assert dict(row) == {"status": "todo", "execution_authorized": 0}
+
+
+def test_governed_unreleased_task_dashboard_bulk_cannot_reach_ready(client):
+    """The bulk status route must enforce the same governed guard as PATCH.
+    Bulk is partial-success (HTTP 200 with per-id outcome), so the governed task
+    must be reported ok=False/refused and its raw row must stay todo/0."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="governed bulk regression", governed=True, assignee="relay")
+
+    resp = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [task_id], "status": "ready"})
+    assert resp.status_code == 200, resp.text
+    entry = next(r for r in resp.json()["results"] if r["id"] == task_id)
+    assert entry["ok"] is False, entry
+    assert "governed" in entry["error"].lower() or "release" in entry["error"].lower(), entry
+
+    with kbc.connect() as conn:
+        row = conn.execute(
+            "SELECT status, execution_authorized FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+    assert dict(row) == {"status": "todo", "execution_authorized": 0}
+
+
+def test_governed_released_task_dashboard_can_reach_ready(client):
+    """A governed task that has been explicitly released by the trusted authority
+    (default 'default' profile in this isolated home) moves to ready normally —
+    the guard blocks only UNRELEASED governed work, not legitimate flow."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="governed released", governed=True, assignee="relay")
+        ok, reason = kb.release_task(conn, task_id, actor="default", reason="approved", caller_identity="hermes")
+        assert ok, reason
+
+    ready = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "ready"})
+    assert ready.status_code == 200, ready.text
+    with kbc.connect() as conn:
+        row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (task_id,)).fetchone()
+    assert dict(row) == {"status": "ready", "execution_authorized": 1}
+
+
+# ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
 

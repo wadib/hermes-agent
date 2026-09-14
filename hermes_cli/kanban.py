@@ -1047,8 +1047,14 @@ def _cmd_release(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     tid = args.task_id
+    # Slip #004: the release AUTHORITY is the active profile identity, resolved
+    # here by the trusted CLI ingress — never a caller-supplied audit string.
+    # (release is also in _DELEGATED_CHILD_DENIED_ACTIONS as a UX fast-fail; the
+    # DB boundary re-checks delegated context and authority.)
+    from hermes_cli.profiles import get_active_profile_name
+    caller_identity = get_active_profile_name() or None
     with kbc.connect_closing() as conn:
-        ok, err = kb.release_task(conn, tid, actor=author, reason=reason)
+        ok, err = kb.release_task(conn, tid, actor=author, reason=reason, caller_identity=caller_identity)
     if ok:
         suffix = f": {reason}" if reason else ""
         print(f"Released {tid} (execution authorized){suffix}")

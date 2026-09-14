@@ -67,7 +67,7 @@ def test_governed_task_not_promoted_or_claimable_until_release(kanban_home):
 
     # Explicit release is the only thing that grants readiness.
     with kbc.connect() as conn:
-        ok, reason = kb.release_task(conn, child, actor="hermes", reason="approved")
+        ok, reason = kb.release_task(conn, child, actor="hermes", reason="approved", caller_identity="hermes")
         assert ok, reason
         kb.recompute_ready(conn)
         row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (child,)).fetchone()
@@ -117,7 +117,7 @@ def test_governed_review_requires_distinct_reviewer_and_holds(kanban_home):
     review is not auto-dispatched to a worker without explicit assignment."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="gov review", assignee="alice", governed=True)
-        kb.release_task(conn, tid, actor="hermes", reason="go")
+        kb.release_task(conn, tid, actor="hermes", reason="go", caller_identity="hermes")
         kb.claim_task(conn, tid)  # ready -> running under alice
 
         # Same-profile reviewer must be refused.
@@ -151,7 +151,7 @@ def test_governed_conversation_task_cannot_complete_direct_to_done(kanban_home):
             conn, title="gov convo task", assignee="alice", governed=True,
             session_id="sess-abc",  # conversation origin
         )
-        kb.release_task(conn, tid, actor="hermes", reason="go")
+        kb.release_task(conn, tid, actor="hermes", reason="go", caller_identity="hermes")
         kb.claim_task(conn, tid)
         # A delivery-required task needs a durable deliverable before it can
         # enter a pending state (nothing to prove delivered otherwise).
@@ -194,8 +194,18 @@ def test_nongoverned_legacy_behavior_unchanged(kanban_home):
 
 def test_cli_governed_create_and_release_round_trip(kanban_home):
     """The real CLI entry (run_slash, used by both CLI and gateway) creates a
-    governed, fail-closed task and releases it via an explicit `release`."""
+    governed, fail-closed task and releases it via an explicit `release`. The
+    active profile ('default' in this isolated home) is configured as a release
+    authority — the realistic operator setup."""
+    import yaml
     from hermes_cli import kanban as kc
+
+    # Operator configures the release authority (Slip #004): the active profile
+    # must be authorized, else release fails closed.
+    (kanban_home / "config.yaml").write_text(
+        yaml.safe_dump({"kanban": {"governed_release_authorities": ["default"]}}),
+        encoding="utf-8",
+    )
 
     out = kc.run_slash("create 'gov cli task' --assignee alice --governed --json")
     tid = json.loads(out)["id"]
@@ -210,12 +220,28 @@ def test_cli_governed_create_and_release_round_trip(kanban_home):
     assert "release" in kc._DELEGATED_CHILD_DENIED_ACTIONS
 
     rel = kc.run_slash(f"release {tid} approved-by-hermes")
-    assert "Released" in rel
+    assert "Released" in rel, rel
     with kbc.connect() as conn:
         row = conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
         assert row["execution_authorized"] == 1
         evs = [e["kind"] for e in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
         assert "released" in evs
+
+
+def test_cli_governed_release_rejected_for_unauthorized_profile(kanban_home):
+    """When the active profile is NOT a configured release authority, the CLI
+    release fails closed and the task stays unreleased."""
+    from hermes_cli import kanban as kc
+
+    # No config -> fail-closed default authority set is {'hermes'}; the active
+    # profile here resolves to 'default', which is not authorized.
+    out = kc.run_slash("create 'gov cli unauth' --assignee alice --governed --json")
+    tid = json.loads(out)["id"]
+    rel = kc.run_slash(f"release {tid} attempt")
+    assert "cannot release" in rel.lower(), rel
+    with kbc.connect() as conn:
+        row = conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["execution_authorized"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +257,7 @@ def _deliver_governed_task(conn, *, acceptance_owner):
         conn, title="gov deliver", assignee="alice", governed=True,
         session_id="sess-x", acceptance_owner=acceptance_owner,
     )
-    kb.release_task(conn, tid, actor="hermes", reason="go")
+    kb.release_task(conn, tid, actor="hermes", reason="go", caller_identity="hermes")
     kb.claim_task(conn, tid)
     kb.add_attachment(conn, tid, filename="r.md", stored_path="/tmp/r.md", size=2)
     assert kb.complete_task(conn, tid, summary="done")
@@ -310,4 +336,84 @@ def test_unblock_holds_governed_unreleased_task_in_todo(kanban_home):
         row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
         assert row["status"] == "todo", "governed unreleased task must not be queued to ready on unblock"
         assert row["execution_authorized"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Slip #004 — DB authority boundary: complete_task and release authorization
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_rejects_governed_unreleased_regardless_of_surface(kanban_home):
+    """complete_task at the DB boundary must refuse a governed, unreleased task —
+    even if a caller forces status to 'ready' directly. Governed work cannot
+    reach done without an authorized release + acceptance lifecycle."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gov complete guard", assignee="alice", governed=True)
+        # Simulate a raw/forced ready (the dashboard bypass class) — the DB
+        # boundary must still refuse completion of unreleased governed work.
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.complete_task(conn, tid, result="sneaky done") is False
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] != "done"
+
+
+def test_complete_task_governed_released_lands_delivery_pending_not_done(kanban_home):
+    """A released governed task completes to delivery_pending (acceptance
+    lifecycle), never directly to done — internal governed work included (no
+    session_id / creator_task_id)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="internal gov", assignee="alice", governed=True)
+        kb.release_task(conn, tid, actor="default", reason="go", caller_identity="hermes")
+        kb.claim_task(conn, tid)
+        kb.add_attachment(conn, tid, filename="r.md", stored_path="/tmp/r.md", size=2)
+        assert kb.complete_task(conn, tid, summary="done")
+        row = conn.execute("SELECT status, acceptance_owner FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "delivery_pending", "internal governed work must not reach done directly"
+        assert row["acceptance_owner"] == "hermes"
+
+
+def test_release_rejects_untrusted_caller_identity(kanban_home):
+    """release_task must reject an untrusted caller identity and must NOT trust a
+    caller-supplied actor string. Raw state stays todo/execution_authorized=0."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="release authority", assignee="relay", governed=True)
+        # Untrusted caller identity -> rejected.
+        ok, reason = kb.release_task(conn, tid, actor="untrusted-profile", reason="probe",
+                                     caller_identity="untrusted-profile")
+        assert not ok, reason
+        row = conn.execute("SELECT status, execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert dict(row) == {"status": "todo", "execution_authorized": 0}
+
+        # Spoofed actor text cannot bypass the caller identity gate.
+        ok2, _ = kb.release_task(conn, tid, actor="hermes", reason="spoof",
+                                 caller_identity="untrusted-profile")
+        assert not ok2
+        assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 0
+
+
+def test_release_trusted_authority_succeeds_once_and_is_idempotent(kanban_home):
+    """The configured/trusted release authority releases once; a concurrent/
+    second release is idempotent and writes no duplicate 'released' event."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="release once", assignee="relay", governed=True)
+        ok, reason = kb.release_task(conn, tid, actor="default", reason="go", caller_identity="hermes")
+        assert ok, reason
+        assert conn.execute("SELECT execution_authorized FROM tasks WHERE id=?", (tid,)).fetchone()["execution_authorized"] == 1
+
+        ok2, _ = kb.release_task(conn, tid, actor="default", reason="again", caller_identity="hermes")
+        assert ok2  # idempotent success
+        released_events = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND kind='released'", (tid,)
+        ).fetchone()["n"]
+        assert released_events == 1, "second release must not write a duplicate authorization event"
+
+
+def test_release_rejects_nongoverned_task(kanban_home):
+    """release_task only applies to governed work; a non-governed task is refused
+    (nothing to release), preserving legacy behavior."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="legacy", assignee="relay")
+        ok, reason = kb.release_task(conn, tid, actor="default", reason="n/a", caller_identity="hermes")
+        assert not ok
+
 
