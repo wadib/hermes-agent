@@ -2753,6 +2753,75 @@ def accept_delivery(
     raise ValueError("acceptance requires trusted gateway or desktop ingress")
 
 
+def accept_internal_governed_delivery(
+    conn: sqlite3.Connection, task_id: str, *, accepting_owner: str,
+    capability: Optional[str] = None,
+) -> bool:
+    """Slip #007 durable internal acceptance route for governed work with NO
+    conversation origin (``session_id`` is None).
+
+    Slip #005 HIGH #2: forcing ``delivery_required`` on internal governed tasks
+    left them stranded at ``delivery_pending`` — the conversation-delivery
+    machinery (outbox platform/conversation_ref, notify subscription) never
+    applies, so ``awaiting_acceptance`` was unreachable and the named owner could
+    never accept. This provides the missing route: the trusted board service
+    (holding ``capability``) finalizes an internal governed task directly from
+    ``delivery_pending`` to ``done`` on behalf of the named ``acceptance_owner``,
+    recording a durable ``task_acceptances`` row.
+
+    Fail-closed conditions (each returns False, none strand silently):
+    - invalid/missing service capability (authority, not identity);
+    - task missing / not governed / has a conversation origin (session_id set —
+      that path uses the gateway/desktop acceptance, not this one);
+    - task not in ``delivery_pending``;
+    - ``accepting_owner`` is not the task's named acceptance owner;
+    - an acceptance already exists (idempotent guard).
+    """
+    from hermes_cli import kanban_authority
+    if not kanban_authority.verify_capability(capability):
+        _append_event(conn, task_id, "acceptance_rejected", {
+            "reason": "missing_or_invalid_service_capability", "source": "internal_service",
+        })
+        return False
+    accepting_owner = str(accepting_owner or "").strip()
+    now = int(time.time())
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None or not task.governed:
+            return False
+        if task.session_id:
+            # Conversation-originated: must use the gateway/desktop route which
+            # binds the real delivery receipt. Not this internal path.
+            return False
+        if task.status != "delivery_pending":
+            return False
+        if not _governed_acceptance_owner_ok(task, accepting_owner):
+            _append_event(conn, task_id, "acceptance_rejected", {
+                "reason": "acceptance_owner_mismatch", "required_owner": task.acceptance_owner,
+                "source": "internal_service",
+            })
+            return False
+        if get_task_acceptance(conn, task_id) is not None:
+            return False
+        message_ref = f"internal:{task_id}"
+        conn.execute(
+            "INSERT INTO task_acceptances (task_id, accepted_by, source, user_message_ref, accepted_at) VALUES (?, ?, ?, ?, ?)",
+            (task_id, accepting_owner, "internal_service", message_ref, now),
+        )
+        if conn.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=? AND status='delivery_pending'",
+            (now, task_id),
+        ).rowcount != 1:
+            return False
+        _append_event(conn, task_id, "accepted", {
+            "accepted_by": accepting_owner, "source": "internal_service",
+            "user_message_ref": message_ref,
+        })
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    return True
+
+
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
 
@@ -4169,24 +4238,26 @@ def request_changes(
 
 def release_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    caller_identity: Optional[str] = None,
+    caller_identity: Optional[str] = None, capability: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Slip #002/#004 explicit release: grant a governed task execution authority.
+    """Slip #002/#004/#007 explicit release: grant a governed task execution authority.
 
     A governed task is created ``execution_authorized=0`` and cannot claim/run
     or auto-promote until this durable action fires. Writes an auditable
     ``released`` event and, when parents are satisfied, promotes it to its
     resumable phase via ``recompute_ready``. Returns ``(ok, reason)``.
 
-    Authority (Slip #004): the release is permitted ONLY when ``caller_identity``
-    — resolved by the trusted ingress (CLI: active profile; NOT a caller-supplied
-    audit string) — is in the durable release-authority set
-    (:func:`resolve_release_authorities`). Delegated-child contexts are rejected.
-    ``actor`` is retained as audited provenance only and never confers authority.
+    Authority (Slip #007): the release is permitted ONLY when ``capability``
+    matches the trusted board service's minted secret
+    (:func:`kanban_authority.verify_capability`). This replaces the Slip #004
+    profile-identity check, which was forgeable via HERMES_HOME (Slip #005/#006).
+    ``caller_identity`` and ``actor`` are retained as audited provenance only and
+    NEVER confer authority. Delegated-child contexts are rejected outright.
 
     Refused for a non-governed task (there is nothing to release) and idempotent
     on an already-released task.
     """
+    from hermes_cli import kanban_authority
     task = get_task(conn, task_id)
     if task is None:
         return False, f"task {task_id} not found"
@@ -4194,18 +4265,18 @@ def release_task(
         return False, f"task {task_id} is not governed; release does not apply"
     if task.execution_authorized:
         return True, None  # already released — idempotent (no duplicate event)
-    # Fail closed: a delegated child may never release, and only a trusted
-    # configured release authority may. actor audit text is not authority.
+    # Fail closed: a delegated child may never release, and only a holder of the
+    # trusted service capability may. Profile identity / actor is not authority.
     _assert_not_delegated_child_mutation()
-    if not _is_release_authorized(caller_identity):
+    if not kanban_authority.verify_capability(capability):
         _append_event(conn, task_id, "release_rejected", {
-            "reason": "unauthorized_release_authority",
+            "reason": "missing_or_invalid_service_capability",
             "caller_identity": (caller_identity or None),
             "actor": actor,
         })
         return False, (
-            f"caller {caller_identity!r} is not an authorized governed-release "
-            f"authority (configure kanban.governed_release_authorities)"
+            "governed release requires the trusted board-service capability; "
+            "profile identity does not authorize release (Slip #007)"
         )
     with write_txn(conn):
         cur = conn.execute(
@@ -4218,7 +4289,8 @@ def release_task(
             # the event; report idempotent success without a duplicate event.
             return True, None
         _append_event(conn, task_id, "released", {
-            "actor": actor, "reason": reason, "authorized_by": caller_identity,
+            "actor": actor, "reason": reason, "authorized_by": "service_capability",
+            "caller_identity": (caller_identity or None),
         })
     # Outside the txn (own IMMEDIATE txn): a released, parent-satisfied task
     # flips to ready now instead of idling until the next tick.

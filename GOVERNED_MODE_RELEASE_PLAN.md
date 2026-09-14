@@ -29,21 +29,21 @@ Re-review: PENDING — Sentinel under a new review slip after this handoff.
   orchestrator_profile, widenable via `kanban.governed_release_authorities`);
   caller-supplied `actor` is audit provenance only and confers no authority.
 
-## Authority model / trust boundary (BLOCKED-ARCHITECTURE — see GOVERNED_RELEASE_ARCHITECTURE_DECISION.md)
-Slip #006 finding: the release control is NOT a security boundary. The board is
-a same-user-writable SQLite file with no service/OS isolation, so (1) a raw
-`sqlite3` write sets execution_authorized=1 bypassing all app logic, and (2)
-`get_active_profile_name()` derives identity from caller-settable HERMES_HOME, so
-a profile-home spoof forges the 'hermes' release authority. Both bypasses are
-reproduced by strict-xfail tests in tests/hermes_cli/test_kanban_governed_mode.py.
-An unforgeable release CANNOT be built in-process under this threat model.
-Governed release/complete state guards from Slip #004 remain effective ONLY as
-operational/audit controls against non-adversarial mistakes — they must NOT be
-relied on as security. Do NOT enable governed mode on any board as a security
-feature until a real boundary (memo Option A service-owned DB/ACL, or Option B)
-ships, or Wessam explicitly accepts the same-user impersonation residual (Option
-C). The internal-acceptance liveness route is intentionally NOT implemented yet
-because it would inherit the forgeable authority.
+## Authority model / trust boundary (Slip #007 — vertical slice; OPS #007 pending)
+Slip #007 moved governed-release authority off the forgeable profile identity
+(Slip #005/#006) onto a SERVICE CAPABILITY held only by the trusted board
+service (gateway/serve), minted at boot (hermes_cli/kanban_authority.py) and
+used via the gateway control socket. What is REAL and tested now: release
+requires the capability, not identity (the profile-home spoof is closed); a bare
+CLI/agent with no capability and no reachable service fails closed; internal
+(no-session) governed work has a durable acceptance route
+(accept_internal_governed_delivery) so it no longer strands at delivery_pending.
+What remains UNKNOWN / OPS #007-OPS: on a single-user box with no OS ACL, a
+same-user process can still RAW-WRITE the board DB (test_raw_db_write_bypass_is_
+unresolved_residual_ops_007 asserts this residual positively) and could read the
+capability file. The capability becomes a real SECURITY boundary only once the
+board DB + capability file are ACL-restricted to a separate Windows service
+account. Do NOT claim the in-process capability secures a same-user box.
 
 ## Proof no restart occurred during this slip
 - No `hermes desktop --force-build`, `npm run build`, PM2 action, gateway

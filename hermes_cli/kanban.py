@@ -1047,14 +1047,27 @@ def _cmd_release(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     tid = args.task_id
-    # Slip #004: the release AUTHORITY is the active profile identity, resolved
-    # here by the trusted CLI ingress — never a caller-supplied audit string.
-    # (release is also in _DELEGATED_CHILD_DENIED_ACTIONS as a UX fast-fail; the
-    # DB boundary re-checks delegated context and authority.)
-    from hermes_cli.profiles import get_active_profile_name
-    caller_identity = get_active_profile_name() or None
-    with kbc.connect_closing() as conn:
-        ok, err = kb.release_task(conn, tid, actor=author, reason=reason, caller_identity=caller_identity)
+    # Slip #007: authority is the trusted board-service CAPABILITY, never the
+    # caller's profile identity (forgeable via HERMES_HOME — Slip #005/#006). If
+    # THIS process minted the capability (it is the service), release directly.
+    # Otherwise act as a client: ask the gateway (which holds the capability) to
+    # perform the release. No reachable gateway => fail closed (no release).
+    from hermes_cli import kanban_authority
+    from hermes_constants import get_hermes_home
+    cap = kanban_authority.in_process_capability()
+    if cap:
+        with kbc.connect_closing() as conn:
+            ok, err = kb.release_task(conn, tid, actor=author, reason=reason,
+                                      caller_identity=f"service:{author}", capability=cap)
+    else:
+        from gateway.control_socket import call_gateway_control
+        res = call_gateway_control(get_hermes_home(), "governed-release",
+                                   {"task_id": tid, "reason": reason, "actor": author})
+        if res is None:
+            print(f"cannot release {tid}: no trusted board service is reachable "
+                  f"(governed release is service-owned; Slip #007)", file=sys.stderr)
+            return 1
+        ok, err = bool(res.get("ok")), res.get("error")
     if ok:
         suffix = f": {reason}" if reason else ""
         print(f"Released {tid} (execution authorized){suffix}")
